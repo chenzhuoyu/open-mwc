@@ -22,7 +22,11 @@ from asyncio import Queue
 from asyncio import StreamReader
 from asyncio import StreamWriter
 
-from Crypto.Cipher import AES
+from cryptography.hazmat.primitives.ciphers import Cipher
+from cryptography.hazmat.primitives.ciphers import CipherContext
+
+from cryptography.hazmat.primitives.ciphers.modes import CBC
+from cryptography.hazmat.primitives.ciphers.algorithms import AES128
 
 LOG_FMT         = '%(asctime)s %(name)s [%(levelname)s] %(message)s'
 LOG_LEVEL       = logging.DEBUG
@@ -242,12 +246,18 @@ class Secret:
             '}'
         ])
 
+    def _cipher(self, chan: int) -> Cipher:
+        return Cipher(AES128(self.session_key[chan]), CBC(bytes(16)))
+
+    def _transform(self, ctx: CipherContext, data: bytes) -> bytes:
+        return ctx.update(data) + ctx.finalize()
+
     def encrypt(self, chan: int, data: bytes) -> bytes:
         data = data.ljust(((len(data) - 1 >> 4) + 1 << 4), b'\0')
-        return AES.new(self.session_key[chan], mode = AES.MODE_CBC, iv = bytes(16)).encrypt(data)
+        return self._transform(self._cipher(chan).encryptor(), data)
 
     def decrypt(self, chan: int, data: bytes, size: int) -> bytes:
-        return AES.new(self.session_key[chan], mode = AES.MODE_CBC, iv = bytes(16)).decrypt(data)[:size]
+        return self._transform(self._cipher(chan).decryptor(), data)[:size]
 
     def calc_unbind_token(self, chan: int, addr: str, port: int) -> bytes:
         return hashlib.md5(self.encrypt(chan, socket.inet_aton(addr) + port.to_bytes(2, 'little'))).digest()
@@ -341,18 +351,36 @@ class StreamSerdes:
         yield from self._decode_iter(chan)
 
 class PacketSerdes:
-    secret: Secret
+    log    : Logger
+    secret : Secret
 
     def __init__(self, secret: Secret):
+        self.log    = logging.getLogger('mwc11.serdes')
         self.secret = secret
 
     async def read(self, rd: StreamReader, chan: int) -> Packet:
-        data = await rd.readexactly(32)
-        magic, cmd, size, ver = struct.unpack('IIII', data[:16])
+        data = await rd.readexactly(4)
+        magic, = struct.unpack('I', data)
 
         # check packet magic number
+        while len(data) < 1024 and magic != RECVER_MAGIC:
+            data += await rd.readexactly(1)
+            magic, = struct.unpack_from('I', data, -4)
+
+        # still not synchronizing
         if magic != RECVER_MAGIC:
-            raise ValueError('invalid packet magic: ' + repr(data))
+            raise ValueError('cannot find synchronization point: ' + repr(data))
+
+        # check for skipped garbage data
+        if len(data) != 4:
+            self.log.warning(
+                'Skipping garbage data:\n' +
+                ('\n' + ' ' * 4).join(hexdump.hexdump(data[:-4], result = 'generator'))
+            )
+
+        # read the remaining header data
+        data = await rd.readexactly(28)
+        cmd, size, ver = struct.unpack('III', data[:12])
 
         # command and signature
         sig = data[16:]
@@ -384,7 +412,7 @@ class FrameDemux:
     frames : Queue
 
     def __init__(self):
-        self.log    = logging.getLogger('demux')
+        self.log    = logging.getLogger('mwc11.demux')
         self.vidx   = -1
         self.vbuf   = b''
         self.frames = Queue()

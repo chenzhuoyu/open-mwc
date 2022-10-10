@@ -175,9 +175,9 @@ class RPCResponse(Payload):
             obj        = {
                 k: v
                 for k, v in (
-                    ( 'id'    , self.id    ),
-                    ( 'data'  , self.data  ),
-                    ( 'error' , self.error and {
+                    ( 'id'     , self.id   ),
+                    ( 'result' , self.data ),
+                    ( 'error'  , self.error and {
                         kk: vv
                         for kk, vv in (
                             ( 'code'    , self.error.code    ),

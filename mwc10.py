@@ -4,6 +4,7 @@
 import os
 import time
 import json
+import base64
 import struct
 import hashlib
 import asyncio
@@ -15,10 +16,27 @@ from functools import cached_property
 
 from typing import Any
 from typing import Union
+from typing import Optional
+
+from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+from cryptography.hazmat.primitives.ciphers import Cipher
+from cryptography.hazmat.primitives.ciphers.modes import CBC
+from cryptography.hazmat.primitives.ciphers.algorithms import AES128
+
+from cryptography.hazmat.primitives._serialization import Encoding
+from cryptography.hazmat.primitives._serialization import PublicFormat
+
+from cryptography.hazmat.primitives.asymmetric.ec import ECDH
+from cryptography.hazmat.primitives.asymmetric.ec import SECP256R1
+from cryptography.hazmat.primitives.asymmetric.ec import generate_private_key
+from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey
 
 from miio import Payload
 from miio import RPCError
 from miio import RPCRequest
+from miio import RPCResponse
 
 from miio import MiioRPC
 from miio import MiioAppConfig
@@ -197,7 +215,7 @@ class GatewayProperties(Properties):
             },
         }
 
-class MwcKeyStore:
+class KeyStore:
     @cached_property
     def static_keys(self) -> dict[int, str]:
         return {}
@@ -215,17 +233,18 @@ class MwcKeyStore:
         kbuf[seed] = skey
         return seed, skey
 
-class MwcConfig:
-    ap_ssid    : str = 'XMCONFIG-0006262228000576'
-    ap_passwd  : str = '6bbca0049a'
-    device_mac : str = 'E0:A2:5A:0D:DC:1C'
+class Settings:
+    ap_ssid    : str   = 'XMCONFIG-0006262228000576'
+    ap_passwd  : str   = '6bbca0049a'
+    device_mac : str   = 'E0:A2:5A:0D:DC:1C'
+    device_oob : bytes = b'9Zc3FlkRT5WydM0Sa57pew=='
 
 class MiioApp(MiioApplication):
     did       : int
     log       : Logger
     rpc       : MiioRPC
-    cfg       : MwcConfig
-    keys      : MwcKeyStore
+    cfg       : Settings
+    keys      : KeyStore
     uptime    : int
     gw_props  : GatewayProperties
     cam_props : dict[str, CameraProperties]
@@ -233,9 +252,9 @@ class MiioApp(MiioApplication):
     def __init__(self, rpc: MiioRPC, cfg: MiioAppConfig):
         self.rpc       = rpc
         self.did       = cfg.security_provider.device_id
-        self.log       = logging.getLogger('miio.events')
-        self.cfg       = MwcConfig()
-        self.keys      = MwcKeyStore()
+        self.log       = logging.getLogger('mwc10')
+        self.cfg       = Settings()
+        self.keys      = KeyStore()
         self.uptime    = cfg.uptime
         self.gw_props  = GatewayProperties()
         self.cam_props = {}
@@ -243,6 +262,11 @@ class MiioApp(MiioApplication):
     @classmethod
     def device_model(cls) -> str:
         return DEVICE_MODEL
+
+    def _send_reply(self, p: RPCRequest, *, data: Any = None, error: Optional[Exception] = None):
+        if data is not None or error is not None:
+            self.log.debug('RPC response: ' + str(RPCResponse(p.id, data = data, error = error)))
+            self.rpc.reply_to(p, data = data, error = error)
 
     async def device_ready(self):
         await asyncio.wait([
@@ -297,34 +321,54 @@ class MiioApp(MiioApplication):
         # check for method
         if func is None:
             self.log.error('Unknown RPC method %r. request = %s' % (meth, p))
-            self.rpc.reply_to(p, error = RPCError(-1, 'unknown RPC method'))
+            self._send_reply(p, error = RPCError(-1, 'unknown RPC method'))
             return
 
         # attempt to handle the request
         try:
             resp = await func(self, p)
         except RPCError as e:
-            self.rpc.reply_to(p, error = e)
+            self._send_reply(p, error = e)
         except Exception:
             self.log.exception('Exception when handling RPC request: ' + str(p))
-            self.rpc.reply_to(p, error = RPCError(-1, 'unhandled exception'))
+            self._send_reply(p, error = RPCError(-1, 'unhandled exception'))
         else:
-            if resp is not None:
-                self.rpc.reply_to(p, data = resp)
+            self._send_reply(p, data = resp)
 
     async def _rpc_nop(self, _: RPCRequest):
         pass
 
     async def _rpc_get_gwinfo(self, p: RPCRequest):
-        pkey = Payload.type_checked(p.args['app_pub_key'], str)
-        seed, skey = self.keys.create_static_key()
+        pkey = base64.b64decode(Payload.type_checked(p.args['app_pub_key'], str).encode('utf-8'))
+        seed, mkey = self.keys.create_static_key()
 
-        info = json.dumps({
-            'ssid'           : self.cfg.ap_ssid,
-            'passwd'         : self.cfg.ap_passwd,
-            'static_key'     : skey,
-            'static_key_num' : seed,
-        })
+        # compose the plain text
+        data = json.dumps(
+            separators = (',', ':'),
+            obj        = {
+                'ssid'           : self.cfg.ap_ssid,
+                'passwd'         : self.cfg.ap_passwd,
+                'static_key'     : mkey,
+                'static_key_num' : seed,
+            },
+        )
+
+        # generate a key pair, and derive the encryption key
+        nkey = generate_private_key(SECP256R1())
+        skey = nkey.exchange(ECDH(), EllipticCurvePublicKey.from_encoded_point(SECP256R1(), pkey))
+        aesc = Cipher(AES128(HKDF(SHA256(), 16, Settings.device_oob, b'').derive(skey)), CBC(bytes(16))).encryptor()
+
+        # encrypt the response data
+        data = data.encode('utf-8')
+        pads = bytes([16 - (len(data) % 16)])
+        rbuf = aesc.update(data + pads * pads[0]) + aesc.finalize()
+        rkey = nkey.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+
+        # construct the response
+        return {
+            'gw_pub_key'   : base64.b64encode(rkey).decode('utf-8'),
+            'encrypt_data' : base64.b64encode(rbuf).decode('utf-8'),
+        }
 
     async def _rpc_get_properties(self, p: RPCRequest) -> list[dict[str, Any]]:
         vals = []
