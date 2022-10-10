@@ -3,6 +3,7 @@
 
 import os
 import ssl
+import sys
 import asn1
 import json
 import time
@@ -11,12 +12,15 @@ import struct
 import hashlib
 import asyncio
 import logging
+import argparse
 import requests
-import coloredlogs
+import importlib.util
+
+from types import ModuleType
+from weakref import ReferenceType
 
 from enum import IntEnum
 from logging import Logger
-from weakref import ReferenceType
 from functools import cached_property
 
 from ssl import SSLContext
@@ -31,35 +35,15 @@ from typing import Union
 from typing import Optional
 from typing import Sequence
 
-from asyncio import Task
-from asyncio import Queue
 from asyncio import Future
 from asyncio import TimerHandle
 from asyncio import StreamReader
 from asyncio import StreamWriter
 
-LOG_FMT             = '%(asctime)s %(name)s [%(levelname)s] %(message)s'
-LOG_LEVEL           = logging.DEBUG
-
-HW_VER              = 'Linux'
-FW_VER              = '4.1.6_1999'
-MIIO_VER            = '0.0.9'
-MIIO_CLI_VER        = '4.1.6'
-
-DEVICE_MAC          = 'E0:A2:5A:0D:DC:1C'
-DEVICE_MODEL        = 'mxiang.camera.mwc10'
-
 HEADER_SIZE         = 8
 REQUEST_TIMEOUT     = 10
 TIMESYNC_INTERVAL   = 30
 HEARTBEAT_INTERVAL  = 10
-
-AP_ETH_WIRED = {
-    'ssid'  : 'Wired Ethernet',
-    'bssid' : 'FF:FF:FF:FF:FF:FF',
-    'rssi'  : '0',
-    'freq'  : 2412,
-}
 
 class LoginStatus(IntEnum):
     Ok      = 0
@@ -91,6 +75,9 @@ class RPCError(Exception):
     code    : int
     data    : Any
     message : str
+
+    class Code(IntEnum):
+        NoSuchProperty  = -4003
 
     def __init__(self, code: int, message: str, *, data: Any = None):
         self.code    = code
@@ -485,27 +472,27 @@ class Signature:
         enc.leave()
         return enc.output()
 
-class SecurityProvider:
+class MiioSecurityProvider:
     @property
     def device_id(self) -> int:
-        raise NotImplementedError()
+        raise NotImplementedError('device_id')
 
     @property
     def root_cert(self) -> str:
-        raise NotImplementedError()
+        raise NotImplementedError('root_cert')
 
     @property
     def vendor_cert(self) -> str:
-        raise NotImplementedError()
+        raise NotImplementedError('vendor_cert')
 
     @property
     def device_cert(self) -> str:
-        raise NotImplementedError()
+        raise NotImplementedError('device_cert')
 
-    def generate_signature(self, _: bytes) -> Signature:
-        raise NotImplementedError()
+    def generate_signature(self, data: bytes) -> Signature:
+        raise NotImplementedError('generate_signature()', data)
 
-class MJACSecurityProvider(SecurityProvider):
+class MiioMJACSecurityProvider(MiioSecurityProvider):
     dev: MJAC
 
     def __init__(
@@ -542,7 +529,7 @@ class MJACSecurityProvider(SecurityProvider):
 
 class LoginCtx:
     algo     : SignAlgorithm
-    secp     : SecurityProvider
+    secp     : MiioSecurityProvider
     dev_rand : str
     srv_rand : str
 
@@ -550,7 +537,7 @@ class LoginCtx:
         SignAlgorithm.MJAC,
     ]
 
-    def __init__(self, secp: SecurityProvider):
+    def __init__(self, secp: MiioSecurityProvider):
         self.secp     = secp
         self.algo     = SignAlgorithm.Invalid
         self.srv_rand = ''
@@ -598,10 +585,10 @@ class LoginCtx:
 
 class Sender:
     def next_seq(self) -> int:
-        raise NotImplementedError
+        raise NotImplementedError('next_seq()')
 
-    def send_packet(self, _: Packet):
-        raise NotImplementedError
+    def send_packet(self, packet: Packet):
+        raise NotImplementedError('send_packet()', packet)
 
 class MiioRPC:
     log    : Logger
@@ -657,270 +644,176 @@ class MiioRPC:
         tmr.cancel()
         fut.set_result(p)
 
-class CameraSIID(IntEnum):
-    pass
+class MiioAppConfig:
+    args              : list[str]
+    uptime            : float
+    app_class         : type['MiioApplication']
+    app_module        : ModuleType
+    security_provider : MiioSecurityProvider
 
-class GatewaySIID(IntEnum):
-    CameraControl   = 2
-    StorageSD       = 3
-    StorageUSB      = 4
-    StorageControl  = 5
-    OTA             = 6
-
-class OTAPIID(IntEnum):
-    Progress        = 1
-    State           = 2
-
-class StoragePIID(IntEnum):
-    Enabled         = 1
-    TotalSize       = 2
-    FreeSize        = 3
-    UsedSize        = 4
-    Status          = 5
-
-class CameraControlPIID(IntEnum):
-    PowerSwitch     = 1
-
-class StorageControlPIID(IntEnum):
-    StorageSwitch   = 1
-    Type            = 2
-    LightIndicator  = 3
-
-SIID = Union[
-    CameraSIID,
-    GatewaySIID,
-]
-
-PIID = Union[
-    OTAPIID,
-    StoragePIID,
-    CameraControlPIID,
-    StorageControlPIID,
-]
-
-class MiioProperties:
-    @property
-    def storage(self) -> dict[SIID, dict[PIID, Any]]:
-        raise NotImplemented
-
-    def get(self, siid: SIID, piid: PIID) -> Any:
-        if siid not in self.storage:
-            raise ValueError('invalid SIID ' + str(siid))
-        elif piid not in self.storage[siid]:
-            raise ValueError('invalid PIID %s for SIID %s' % (piid, siid))
-        else:
-            return self.storage[siid][piid]
-
-    def set(self, siid: SIID, piid: PIID, value: Any):
-        if siid not in self.storage:
-            raise ValueError('invalid SIID: ' + str(siid))
-        elif piid not in self.storage[siid]:
-            raise ValueError('invalid PIID for SIID %s: %s' % (siid, piid))
-        elif type(value) is not type(self.storage[siid][piid]):
-            raise TypeError('%s expected for SIID %s and PIID %s, got %s' % (type(self.storage[siid][piid]), siid, piid, type(value)))
-        else:
-            self.storage[siid][piid] = value
-
-class MiioCameraProperties(MiioProperties):
-    @cached_property
-    def storage(self) -> dict[CameraSIID, dict[PIID, Any]]:
-        return {}
-
-class MiioGatewayProperties(MiioProperties):
-    @cached_property
-    def storage(self) -> dict[GatewaySIID, dict[PIID, Any]]:
-        return {
-            GatewaySIID.CameraControl: {
-                CameraControlPIID.PowerSwitch: False,
-            },
-            GatewaySIID.StorageSD: {
-                StoragePIID.Enabled   : False,
-                StoragePIID.TotalSize : 0,
-                StoragePIID.FreeSize  : 0,
-                StoragePIID.UsedSize  : 0,
-                StoragePIID.Status    : 0,
-            },
-            GatewaySIID.StorageUSB: {
-                StoragePIID.Enabled   : False,
-                StoragePIID.TotalSize : 0,
-                StoragePIID.FreeSize  : 0,
-                StoragePIID.UsedSize  : 0,
-                StoragePIID.Status    : 0,
-            },
-            GatewaySIID.StorageControl: {
-                StorageControlPIID.StorageSwitch  : False,
-                StorageControlPIID.Type           : 0,
-                StorageControlPIID.LightIndicator : False,
-            },
-            GatewaySIID.OTA: {
-                OTAPIID.Progress : 0,
-                OTAPIID.State    : 'idle',
-            },
-        }
-
-class MiioEvents:
-    did       : int
-    log       : Logger
-    rpc       : MiioRPC
-    uptime    : int
-    gw_props  : MiioGatewayProperties
-    cam_props : dict[str, MiioCameraProperties]
-
-    def __init__(self, did: int, rpc: MiioRPC, uptime: int):
-        self.did       = did
-        self.rpc       = rpc
-        self.log       = logging.getLogger('miio.events')
-        self.uptime    = uptime
-        self.gw_props  = MiioGatewayProperties()
-        self.cam_props = {}
-
-    async def device_ready(self):
-        await asyncio.wait([
-            self.rpc.send('props', ota_state = 'idle'),
-            self.rpc.send('_async.stat',
-                model           = DEVICE_MODEL,
-                fw_ver          = FW_VER,
-                miio_client_ver = MIIO_CLI_VER,
-                **{
-                    'miio.sc_type': {
-                        'device_sc_type': [16],
-                        'user_sc_type': -1,
-                    },
-                }
-            ),
-            self.rpc.send('_otc.info',
-                life            = int(time.monotonic() - self.uptime),
-                uid             = 6598941468,
-                model           = DEVICE_MODEL,
-                token           = '6c686b35314175486c5a426851444a56',
-                ipflag          = 1,
-                miio_ver        = MIIO_VER,
-                mac             = DEVICE_MAC,
-                fw_ver          = FW_VER,
-                hw_ver          = HW_VER,
-                miio_client_ver = MIIO_CLI_VER,
-                VmPeak          = 0,
-                VmRSS           = 0,
-                MemFree         = 0,
-                ap              = AP_ETH_WIRED,
-                miio_times      = [0] * 4,
-                netif           = {
-                    'localIp' : '172.20.0.226',
-                    'mask'    : '255.255.255.0',
-                    'gw'      : '172.20.0.254'
-                },
-            ),
-        ])
-        # print('_sync.subdev_upinfo', await self.rpc.send('_sync.subdev_upinfo', did = '589340360', fw_ver = '1.2.1_1999'))
-        # self.task = asyncio.create_task(self._keepalive())
-
-    async def handle_request(self, p: RPCRequest):
-        meth = p.method
-        func = self.__rpc_handlers__.get(meth)
-        self.log.debug('RPC request: ' + str(p))
-
-        # check for method
-        if func is None:
-            self.log.error('Unknown RPC method %r. request = %s' % (meth, p))
-            self.rpc.reply_to(p, error = RPCError(-1, 'invalid request'))
-            return
-
-        # attempt to handle the request
-        try:
-            resp = await func(self, p)
-        except RPCError as e:
-            self.rpc.reply_to(p, error = e)
-        except Exception:
-            self.log.exception('Exception when handling RPC request: ' + str(p))
-            self.rpc.reply_to(p, error = RPCError(-1, 'unhandled exception'))
-        else:
-            if resp is not None:
-                self.rpc.reply_to(p, data = resp)
-
-    async def _rpc_nop(self, _: RPCRequest):
-        pass
-
-    async def _rpc_get_properties(self, p: RPCRequest) -> list[dict[str, Any]]:
-        vals = []
-        args = p.args
-
-        # fetch every property
-        for item in args:
-            try:
-                did = Payload.type_checked(item['did'], str)
-                siid = Payload.type_checked(item['siid'], int)
-                piid = Payload.type_checked(item['piid'], int)
-            except (KeyError, TypeError, ValueError) as e:
-                self.log.error('Invalid RPC request: ' + str(e))
-                raise RPCError(-1, 'invalid request') from None
-            else:
-                if did == str(self.did):
-                    try:
-                        vals.append((did, siid, piid, self.gw_props.get(siid, piid)))
-                    except ValueError as e:
-                        self.log.error('Cannot read property %s.%d.%d: %s' % (did, siid, piid, e))
-                        raise RPCError(-1, 'cannot read property: ' + str(e)) from None
-                # TODO: handle camera properties
-                else:
-                    self.log.warning('No such device: %s.' % did)
-                    raise RPCError(-2, 'no such device')
-
-        # construct the reply
-        return [{
-            'did'   : did,
-            'code'  : 0,
-            'siid'  : siid,
-            'piid'  : piid,
-            'value' : value,
-        } for did, siid, piid, value in vals ]
-
-    __rpc_handlers__ = {
-        'get_properties' : _rpc_get_properties,
+    __providers__ = {
+        'mjac': MiioMJACSecurityProvider,
     }
 
-class MiioClient(Sender):
-    rd     : StreamReader
-    wr     : StreamWriter
-    seq    : int
-    log    : Logger
-    rpc    : MiioRPC
-    ctx    : SSLContext
-    wbuf   : Queue
-    login  : LoginCtx
-    events : MiioEvents
-    uptime : float
+    __arguments__ = [
+        ('-m', '--app', dict(
+            type     = str,
+            help     = 'path of the application module',
+            required = True,
+        )),
+        ('-c', '--class', dict(
+            type     = str,
+            dest     = 'klass',
+            help     = 'name of the application class',
+            default  = 'MiioApp',
+            required = False,
+        )),
+        ('-p', '--security-provider', dict(
+            type     = str,
+            help     = 'security provider name',
+            default  = 'mjac',
+            choices  = __providers__,
+            required = False,
+        )),
+        ('args', dict(
+            help    = 'arguments passed to application',
+            nargs   = '*',
+            metavar = 'ARGS',
+        ))
+    ]
 
-    def __init__(
-        self,
-        rd     : StreamReader,
-        wr     : StreamWriter,
-        ctx    : SSLContext,
-        secp   : SecurityProvider,
-        uptime : int,
-    ):
-        self.rd     = rd
-        self.wr     = wr
-        self.seq    = -1
-        self.ctx    = ctx
-        self.log    = logging.getLogger('miio')
-        self.rpc    = MiioRPC(ReferenceType(self))
-        self.rand   = b''
-        self.wbuf   = Queue()
-        self.state  = 'login_1'
-        self.login  = LoginCtx(secp)
-        self.events = MiioEvents(secp.device_id, self.rpc, uptime)
-        self.uptime = uptime
+    def __init__(self, *args: str):
+        self.uptime = time.monotonic()
+        self._parse(args[1:])
+
+    def _parse(self, args: Sequence[str]):
+        d = self.__arguments__
+        p = argparse.ArgumentParser(description = 'MiIO Client v1.0')
+
+        # add argumnets
+        for v in d:
+            p.add_argument(*v[:-1], **v[-1])
+
+        # parse the args
+        ns = p.parse_args(args)
+        app, cls, secp = ns.app, ns.klass, ns.security_provider
+
+        # load the module
+        spec = importlib.util.spec_from_file_location('miio_app', app)
+        smod = importlib.util.module_from_spec(spec)
+
+        # insert into modules
+        sys.modules['miio_app'] = smod
+        spec.loader.exec_module(smod)
+
+        # find the class
+        try:
+            self.app_class = getattr(smod, cls)
+        except AttributeError:
+            print('* error: class not found: %s:%s' % (app, cls))
+            sys.exit(1)
+
+        # check for subclass
+        if not isinstance(self.app_class, type) or not issubclass(self.app_class, MiioApplication):
+            print('* error: application must be a subclass of MiioApplication: %s:%s' % (app, cls))
+            sys.exit(1)
+
+        # set the app module and security provider
+        self.args = ns.args
+        self.app_module = smod
+        self.security_provider = self.__providers__[secp]()
+
+    async def resolve(self, dns: str = 'dns.io.mi.com', host: str = 'ots.io.mi.com') -> tuple[str, int]:
+        resp = requests.get(
+            url    = 'https://%s/gslb' % dns,
+            params = {
+                'dm'        : host,
+                'id'        : self.security_provider.device_id,
+                'tver'      : 2,
+                'model'     : self.app_class.device_model(),
+                'timestamp' : 1,
+            },
+            headers = {
+                'User-Agent': 'MIoT'
+            }
+        )
+
+        # parse the response
+        resp.raise_for_status()
+        resp = resp.json()
+
+        # check if HTTP DNS is enabled
+        if not resp['info']['enable']:
+            raise RuntimeError('HTTP DNS is not enabled')
+
+        # use the first address
+        addr = resp['info']['host_list'][0]
+        return addr['ip'], addr['port']
+
+    async def connect(self, host: str = 'ots.io.mi.com', port: int = 443, **kwargs) -> 'MiioConnection':
+        kwargs.pop('cafile', None)
+        kwargs.pop('capath', None)
+        kwargs['cadata'] = self.security_provider.root_cert
+
+        # create a SSL context
+        ctx = SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.load_verify_locations(**kwargs)
+
+        # connect to MiIO OT server
+        rd, wr = await asyncio.open_connection(host, port, ssl = ctx)
+        return MiioConnection(rd, wr, ctx, cfg = self)
+
+class MiioApplication:
+    def __init__(self, rpc: MiioRPC, cfg: MiioAppConfig):
+        raise NotImplementedError('__init__()', rpc, cfg)
+
+    @classmethod
+    def device_model(cls) -> str:
+        raise NotImplementedError('device_model()')
+
+    async def device_ready(self):
+        raise NotImplementedError('async device_ready()')
+
+    async def handle_request(self, p: RPCRequest):
+        raise NotImplementedError('async handle_request()', p)
+
+class MiioConnection(Sender):
+    rd    : StreamReader
+    wr    : StreamWriter
+    app   : MiioApplication
+    seq   : int
+    log   : Logger
+    rpc   : MiioRPC
+    ctx   : SSLContext
+    cfg   : MiioAppConfig
+    state : str
+    login : LoginCtx
+
+    def __init__(self, rd: StreamReader, wr: StreamWriter, ctx: SSLContext, cfg: MiioAppConfig):
+        self.rd    = rd
+        self.wr    = wr
+        self.seq   = -1
+        self.cfg   = cfg
+        self.ctx   = ctx
+        self.log   = logging.getLogger('miio')
+        self.rpc   = MiioRPC(ReferenceType(self))
+        self.app   = cfg.app_class(self.rpc, cfg)
+        self.state = 'login_1'
+        self.login = LoginCtx(cfg.security_provider)
 
     def next_seq(self) -> int:
         self.seq += 1
         return self.seq
 
     def send_packet(self, p: Packet):
-        self.wbuf.put_nowait(p)
+        t = time.monotonic_ns()
+        self.wr.write(p.to_bytes())
+        self.log.debug('Packet %s with Seq %d was transmitted in %.3fms' % (p.ty.name, p.seq, (time.monotonic_ns() - t) / 1e6))
 
     async def _timesync(self):
         while True:
-            dt = time.monotonic() - self.uptime
+            dt = time.monotonic() - self.cfg.uptime
             self.log.debug('Time-sync with uptime %.3fs' % dt)
             self.send_packet(Packet.sync(self.next_seq(), int(dt * 1000)))
             await asyncio.sleep(TIMESYNC_INTERVAL)
@@ -938,7 +831,7 @@ class MiioClient(Sender):
                     await asyncio.sleep(1)
                 case 'online':
                     self.state = 'idle'
-                    asyncio.get_running_loop().create_task(self.events.device_ready())
+                    asyncio.get_running_loop().create_task(self.app.device_ready())
                 case 'login_1':
                     self.state = 'wait_login_1'
                     self.log.debug('Login sequence stage 1.')
@@ -962,7 +855,7 @@ class MiioClient(Sender):
     async def _network_handler(self, p: Packet):
         match p.ty:
             case PacketType.RPC:
-                await self.events.handle_request(p.data)
+                await self.app.handle_request(p.data)
             case PacketType.RPCAck:
                 self.rpc.handle_response(p.data)
             case PacketType.SyncAck:
@@ -1002,13 +895,6 @@ class MiioClient(Sender):
             self.log.debug('Received %s packet with Seq %d' % (p.ty.name, p.seq))
             await self._network_handler(p)
 
-    async def _network_transmitter(self):
-        while True:
-            p = await self.wbuf.get()
-            t = time.monotonic_ns()
-            self.wr.write(p.to_bytes())
-            self.log.debug('Packet %s with Seq %d was transmitted in %.3fms' % (p.ty.name, p.seq, (time.monotonic_ns() - t) / 1e6))
-
     async def run_forever(self):
         await asyncio.wait(
             return_when = asyncio.FIRST_COMPLETED,
@@ -1017,133 +903,5 @@ class MiioClient(Sender):
                 asyncio.ensure_future(self._heartbeat()),
                 asyncio.ensure_future(self._login_poller()),
                 asyncio.ensure_future(self._network_receiver()),
-                asyncio.ensure_future(self._network_transmitter()),
             ],
         )
-
-    @staticmethod
-    async def resolve(
-        dns               : str = 'dns.io.mi.com',
-        host              : str = 'ots.io.mi.com',
-        security_provider : Optional[SecurityProvider] = None,
-    ) -> tuple[str, int]:
-        secp = security_provider or MJACSecurityProvider()
-        resp = requests.get(
-            url    = 'https://%s/gslb' % dns,
-            params = {
-                'dm'        : host,
-                'id'        : secp.device_id,
-                'tver'      : 2,
-                'model'     : DEVICE_MODEL,
-                'timestamp' : 1,
-            },
-            headers = {
-                'User-Agent': 'MIoT'
-            }
-        )
-
-        # parse the response
-        resp.raise_for_status()
-        resp = resp.json()
-
-        # check if HTTP DNS is enabled
-        if not resp['info']['enable']:
-            raise RuntimeError('HTTP DNS is not enabled')
-
-        # use the first address
-        addr = resp['info']['host_list'][0]
-        return addr['ip'], addr['port']
-
-    @classmethod
-    async def connect(
-        cls,
-        host              : str = 'ots.io.mi.com',
-        port              : int = 443,
-        security_provider : Optional[SecurityProvider] = None,
-        **kwargs,
-    ) -> 'MiioClient':
-        t0 = time.monotonic()
-        secp = security_provider or MJACSecurityProvider()
-
-        # prevent certificate confliction
-        kwargs.pop('cafile', None)
-        kwargs.pop('capath', None)
-        kwargs['cadata'] = secp.root_cert
-
-        # create a SSL context
-        ctx = SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.check_hostname = False
-        ctx.load_verify_locations(**kwargs)
-
-        # connect to MiIO OT server
-        rd, wr = await asyncio.open_connection(host, port, ssl = ctx)
-        return MiioClient(rd, wr, ctx = ctx, secp = secp, uptime = t0)
-
-async def main():
-    # with open('packets.gdbdump') as fp:
-    #     idx = 0
-    #     host = ''
-    #     date = ''
-    #     name = '(n/a)'
-    #     state = 'host'
-    #     domain = ''
-    #     for line in fp.read().splitlines():
-    #         line = line.strip()
-    #         if not line:
-    #             continue
-    #         if line.startswith('Breakpoint'):
-    #             date = ''
-    #             name = line.split()[-2]
-    #             continue
-    #         if date == '':
-    #             date = '[' + line.strip() + ']'
-    #             continue
-    #         if not line.startswith('$'):
-    #             continue
-    #         if name == 'd0_tls_open':
-    #             val = line.split(maxsplit = 3)[-1]
-    #             if state == 'host':
-    #                 host = val
-    #                 state = 'domain'
-    #                 continue
-    #             elif state == 'domain':
-    #                 domain = val
-    #                 state = 'port'
-    #                 continue
-    #             elif state == 'port':
-    #                 name = '(n/a)'
-    #                 state = 'host'
-    #                 print(date, 'd0_tls_open: host', host, 'domain', domain, 'port', val)
-    #                 print()
-    #                 continue
-    #             else:
-    #                 raise RuntimeError()
-    #         line = line.split('=', 1)[1].strip()
-    #         def gendata():
-    #             for v in line[1:-1].split(','):
-    #                 v = [x.strip() for x in v.split()]
-    #                 x = int(v[0], 16)
-    #                 if len(v) == 1:
-    #                     yield x
-    #                 else:
-    #                     yield from [x] * int(v[2])
-    #         rbuf = bytes(gendata())
-    #         data = StreamReader()
-    #         data.feed_data(rbuf)
-    #         try:
-    #             pkt = await Packet.read_from(data)
-    #             print(date, 'Seq %d:' % idx, name, pkt.ty, pkt.data)
-    #         except ValueError as e:
-    #             print(e)
-    #             print(date, 'Seq %d:' % idx, name, rbuf)
-    #         print()
-    #         idx += 1
-    #         name = '(n/a)'
-    secp = MJACSecurityProvider()
-    host, port = await MiioClient.resolve(security_provider = secp)
-    conn = await MiioClient.connect(host, port, security_provider = secp)
-    await conn.run_forever()
-
-if __name__ == '__main__':
-    coloredlogs.install(fmt = LOG_FMT, level = LOG_LEVEL, milliseconds = True)
-    asyncio.run(main())
