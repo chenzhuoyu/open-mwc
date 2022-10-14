@@ -343,7 +343,7 @@ class MiotApp(MiotApplication):
             ),
             self.rpc.send('_otc.info',
                 life            = int(time.monotonic() - self.uptime),
-                uid             = 6598941468,
+                uid             = self.cfg.device.uid,
                 model           = DEVICE_MODEL,
                 token           = self.cfg.device.bind_key.hex(),
                 ipflag          = 1,
