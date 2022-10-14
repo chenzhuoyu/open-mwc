@@ -2,3 +2,4 @@
 *.bin
 *.pyc
 *.hevc
+*.json

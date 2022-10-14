@@ -422,7 +422,7 @@ class FrameDemux:
 
     def _check_video_frame(self, frame: Frame):
         if self.vidx != frame.index - 1:
-            self.log.warning('Frame dropping: %d - %d' % (self.vidx, frame.index))
+            self.log.warning('Frame dropping: %d - %d', self.vidx, frame.index)
 
     def _parse_video_frame(self, frame: Frame):
         if self.vidx == frame.index:
@@ -456,7 +456,7 @@ class FrameDemux:
             elif frame.type == FrameCmd.VideoHEVC:
                 self._parse_video_frame(frame)
             else:
-                self.log.warning('Dropping unsupported stream frame: ' + repr(frame))
+                self.log.warning('Dropping unsupported stream frame: %r', frame)
 
     def add_signaling_frame(self, frame: Packet):
         self._handle_signaling_frame(frame)
@@ -540,12 +540,10 @@ class MiCameraStation:
         )
 
     async def _serve_dsp_comm(self, _: StreamReader, wr: StreamWriter):
-        while True:
-            await asyncio.sleep(1)  # TODO: handle DspCommSvr logic
+        pass  # TODO: handle DspCommSvr logic
 
     async def _serve_udp_comm(self, _: StreamReader, wr: StreamWriter):
-        while True:
-            await asyncio.sleep(1)  # TODO: handle UDPComSvr logic
+        pass  # TODO: handle UDPComSvr logic
 
     async def _serve_com_send(self, _: StreamReader, wr: StreamWriter):
         _, port = wr.transport.get_extra_info('peername')

@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import sys
 import time
 import json
 import base64
@@ -9,6 +10,7 @@ import struct
 import hashlib
 import asyncio
 import logging
+import argparse
 
 from enum import IntEnum
 from logging import Logger
@@ -17,6 +19,7 @@ from functools import cached_property
 from typing import Any
 from typing import Union
 from typing import Optional
+from typing import Sequence
 
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -33,14 +36,16 @@ from cryptography.hazmat.primitives.asymmetric.ec import SECP256R1
 from cryptography.hazmat.primitives.asymmetric.ec import generate_private_key
 from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey
 
-from miio import Payload
-from miio import RPCError
-from miio import RPCRequest
-from miio import RPCResponse
+from miot import Payload
+from miot import RPCError
+from miot import RPCRequest
+from miot import RPCResponse
 
-from miio import MiioRPC
-from miio import MiioAppConfig
-from miio import MiioApplication
+from miot import MiotRPC
+from miot import MiotApplication
+from miot import MiotConfiguration
+
+from disco import Configuration as DiscoConfiguration
 
 HW_VER       = 'Linux'
 FW_VER       = '4.1.6_1999'
@@ -142,6 +147,17 @@ class Properties:
         else:
             self.storage[siid][piid] = value
 
+    def repr(self, siid: SIID, piid: PIID) -> tuple[str, str]:
+        for ids, vals in self.storage.items():
+            if siid == ids:
+                for idp in vals:
+                    if piid == idp:
+                        return ids.name, idp.name
+                else:
+                    return ids.name, '?'
+        else:
+            return '?', '?'
+
 class CameraProperties(Properties):
     @cached_property
     def storage(self) -> dict[CameraSIID, dict[PIID, Any]]:
@@ -233,27 +249,70 @@ class KeyStore:
         kbuf[seed] = skey
         return seed, skey
 
-class Settings:
-    ap_ssid    : str   = 'XMCONFIG-0006262228000576'
-    ap_passwd  : str   = '6bbca0049a'
-    device_mac : str   = 'E0:A2:5A:0D:DC:1C'
-    device_oob : bytes = b'9Zc3FlkRT5WydM0Sa57pew=='
+class ApSettings:
+    ssid   : str
+    passwd : str
 
-class MiioApp(MiioApplication):
+    def __init__(self, ssid: str, passwd: str):
+        self.ssid   = ssid
+        self.passwd = passwd
+
+    @classmethod
+    def from_dict(cls, cfg: dict[str, Any]) -> 'ApSettings':
+        return cls(
+            ssid   = Payload.type_checked(cfg['ssid'], str),
+            passwd = Payload.type_checked(cfg['passwd'], str),
+        )
+
+class Settings:
+    ap     : ApSettings
+    device : DiscoConfiguration
+
+    def __init__(self, ap: ApSettings, device: DiscoConfiguration):
+        self.ap     = ap
+        self.device = device
+
+    @classmethod
+    def load(cls, args: Sequence[str]) -> 'Settings':
+        p = argparse.ArgumentParser('mwc10')
+        p.add_argument('-c', '--config', metavar = 'FILE', type = str, help = 'config file path', default = 'miio.json')
+
+        # read and parse the file
+        with open(p.parse_args(args).config) as fp:
+            try:
+                return cls.from_dict(Payload.type_checked(json.load(fp), dict))
+            except KeyError as e:
+                raise RuntimeError(
+                    '\n'.join([
+                        'missing configuration section "%s".' % e.args[0],
+                        '',
+                        '    Please run "./mwc10.py config" to perform initialization first.',
+                        '',
+                    ]
+                )) from None
+
+    @classmethod
+    def from_dict(cls, cfg: dict[str, Any]) -> 'Settings':
+        return cls(
+            ap     = ApSettings.from_dict(Payload.type_checked(cfg['ap'], dict)),
+            device = DiscoConfiguration.from_dict(Payload.type_checked(cfg['device'], dict)),
+        )
+
+class MiotApp(MiotApplication):
     did       : int
     log       : Logger
-    rpc       : MiioRPC
+    rpc       : MiotRPC
     cfg       : Settings
     keys      : KeyStore
     uptime    : int
     gw_props  : GatewayProperties
     cam_props : dict[str, CameraProperties]
 
-    def __init__(self, rpc: MiioRPC, cfg: MiioAppConfig):
+    def __init__(self, rpc: MiotRPC, cfg: MiotConfiguration):
         self.rpc       = rpc
         self.did       = cfg.security_provider.device_id
         self.log       = logging.getLogger('mwc10')
-        self.cfg       = Settings()
+        self.cfg       = Settings.load(cfg.args)
         self.keys      = KeyStore()
         self.uptime    = cfg.uptime
         self.gw_props  = GatewayProperties()
@@ -265,7 +324,7 @@ class MiioApp(MiioApplication):
 
     def _send_reply(self, p: RPCRequest, *, data: Any = None, error: Optional[Exception] = None):
         if data is not None or error is not None:
-            self.log.debug('RPC response: ' + str(RPCResponse(p.id, data = data, error = error)))
+            self.log.debug('RPC response: %r', RPCResponse(p.id, data = data, error = error))
             self.rpc.reply_to(p, data = data, error = error)
 
     async def device_ready(self):
@@ -276,7 +335,7 @@ class MiioApp(MiioApplication):
                 fw_ver          = FW_VER,
                 miio_client_ver = MIIO_CLI_VER,
                 **{
-                    'miio.sc_type': {
+                    'miot.sc_type': {
                         'device_sc_type': [16],
                         'user_sc_type': -1,
                     },
@@ -286,10 +345,10 @@ class MiioApp(MiioApplication):
                 life            = int(time.monotonic() - self.uptime),
                 uid             = 6598941468,
                 model           = DEVICE_MODEL,
-                token           = '6c686b35314175486c5a426851444a56',
+                token           = self.cfg.device.bind_key.hex(),
                 ipflag          = 1,
                 miio_ver        = MIIO_VER,
-                mac             = self.cfg.device_mac,
+                mac             = self.cfg.device.mac.hex().upper(),
                 fw_ver          = FW_VER,
                 hw_ver          = HW_VER,
                 miio_client_ver = MIIO_CLI_VER,
@@ -316,11 +375,11 @@ class MiioApp(MiioApplication):
     async def handle_request(self, p: RPCRequest):
         meth = p.method
         func = self.__rpc_handlers__.get(meth)
-        self.log.debug('RPC request: ' + str(p))
+        self.log.debug('RPC request: %r', p)
 
         # check for method
         if func is None:
-            self.log.error('Unknown RPC method %r. request = %s' % (meth, p))
+            self.log.error('Unknown RPC method %r. request = %s', meth, p)
             self._send_reply(p, error = RPCError(-1, 'unknown RPC method'))
             return
 
@@ -330,7 +389,7 @@ class MiioApp(MiioApplication):
         except RPCError as e:
             self._send_reply(p, error = e)
         except Exception:
-            self.log.exception('Exception when handling RPC request: ' + str(p))
+            self.log.exception('Exception when handling RPC request: %r', p)
             self._send_reply(p, error = RPCError(-1, 'unhandled exception'))
         else:
             self._send_reply(p, data = resp)
@@ -353,7 +412,7 @@ class MiioApp(MiioApplication):
             },
         )
 
-        # generate a key pair, and derive the encryption key
+        # generate and exchange keys with ECDH, and derive the encryption key with HKDF
         nkey = generate_private_key(SECP256R1())
         skey = nkey.exchange(ECDH(), EllipticCurvePublicKey.from_encoded_point(SECP256R1(), pkey))
         aesc = Cipher(AES128(HKDF(SHA256(), 16, Settings.device_oob, b'').derive(skey)), CBC(bytes(16))).encryptor()
@@ -377,24 +436,30 @@ class MiioApp(MiioApplication):
         # fetch every property
         for item in p.args:
             try:
-                did = Payload.type_checked(item['did'], str)
+                did  = Payload.type_checked(item['did'], str)
                 siid = Payload.type_checked(item['siid'], int)
                 piid = Payload.type_checked(item['piid'], int)
             except (KeyError, TypeError, ValueError) as e:
-                self.log.error('Invalid RPC request: ' + str(e))
+                self.log.error('Invalid RPC request: %s', e)
                 raise RPCError(-1, 'invalid request') from None
             else:
                 try:
                     if did == str(self.did):
-                        vals.append((did, siid, piid, 0, self.gw_props.get(siid, piid)))
+                        val = self.gw_props.get(siid, piid)
+                        rs, rp = self.gw_props.repr(siid, piid)
+                        vals.append((did, siid, piid, 0, val))
+                        self.log.info('Get station property %s.%s: %r', rs, rp, val)
                     elif did in self.cam_props:
-                        vals.append((did, siid, piid, 0, self.cam_props[did].get(siid, piid)))
+                        val = self.cam_props[did].get(siid, piid)
+                        rs, rp = self.cam_props[did].repr(siid, piid)
+                        vals.append((did, siid, piid, 0, val))
+                        self.log.info('Get device property %s.%s.%s: %r', did, rs, rp, val)
                     else:
                         vals.append((did, siid, piid, RPCError.Code.NoSuchProperty, null))
-                        self.log.warning('Cannot read property %s.%d.%d: device not found' % (did, siid, piid))
+                        self.log.warning('Cannot read property %s.%d.%d: device not found', did, siid, piid)
                 except ValueError as e:
                     vals.append((did, siid, piid, RPCError.Code.NoSuchProperty, null))
-                    self.log.warning('Cannot read property %s.%d.%d: %s' % (did, siid, piid, e))
+                    self.log.warning('Cannot read property %s.%d.%d: %s', did, siid, piid, e)
 
         # construct the response
         return [
@@ -417,3 +482,48 @@ class MiioApp(MiioApplication):
         'get_properties' : _rpc_get_properties,
     }
 
+def config(args: Sequence[str]):
+    p = argparse.ArgumentParser('%s config' % sys.argv[0])
+    p.add_argument('-c', '--config', metavar = 'CFG', type = str, help = 'config file path', default = 'miio.json')
+    p.add_argument('action', type = str, nargs = '*')
+
+    # parse the arguments
+    ns = p.parse_args(args)
+    fname, action = ns.config, ns.action
+
+    # check for action
+    if not action:
+        usage()
+    else:
+        cmd, *args = action
+
+    # load and update the current config
+    try:
+        with open(fname) as fp:
+            cfg = Payload.type_checked(json.load(fp), dict)
+    except (TypeError, FileNotFoundError):
+        cfg = {}
+
+    # check for module name
+    match (cmd, len(args)):
+        case ('ap', 2) : cfg['ap'] = { 'ssid': args[0], 'passwd': args[1] }
+        case _         : usage()
+
+    # save the new configuration if modified
+    with open(ns.config, 'w') as fp:
+        json.dump(cfg, fp, indent = 4)
+
+def usage():
+    print('usage: %s config [-h] [-c CFG] ap <ssid> <passwd>' % sys.argv[0], file = sys.stderr)
+    sys.exit(1)
+
+def main():
+    if len(sys.argv) < 2:
+        usage()
+    else:
+        match sys.argv[1]:
+            case 'config' : config(sys.argv[2:])
+            case _        : usage()
+
+if __name__ == '__main__':
+    main()

@@ -16,11 +16,9 @@ import argparse
 import requests
 import importlib.util
 
-from types import ModuleType
-from weakref import ReferenceType
-
 from enum import IntEnum
 from logging import Logger
+from weakref import ReferenceType
 from functools import cached_property
 
 from ssl import SSLContext
@@ -45,17 +43,6 @@ REQUEST_TIMEOUT     = 10
 TIMESYNC_INTERVAL   = 30
 HEARTBEAT_INTERVAL  = 10
 
-class LoginStatus(IntEnum):
-    Ok      = 0
-    Stage2  = 1
-    Error   = -1
-    NoCode  = 1 << 65
-
-class SignAlgorithm(IntEnum):
-    Invalid = 0
-    HMAC    = 1
-    MJAC    = 2
-
 class Payload:
     def to_bytes(self) -> bytes:
         raise NotImplementedError
@@ -77,7 +64,8 @@ class RPCError(Exception):
     message : str
 
     class Code(IntEnum):
-        NoSuchProperty  = -4003
+        NoSuchProperty      = -4003
+        InvalidParameters   = -32602
 
     def __init__(self, code: int, message: str, *, data: Any = None):
         self.code    = code
@@ -142,9 +130,16 @@ class RPCRequest(Payload):
     def from_json(cls, data: str) -> 'RPCRequest':
         obj = json.loads(data)
         rid = cls.type_checked(obj.get('id', None), (int, None))
-        args = cls.type_checked(obj.get('params', {}), (list, dict))
+        args = cls.type_checked(obj.get('params', {}), (str, list, dict))
         method = cls.type_checked(obj['method'], str)
-        return cls(method, id = rid, args = args)
+
+        # handle the special case of an empty string
+        if not isinstance(args, str):
+            return cls(method, id = rid, args = args)
+        elif args == '':
+            return cls(method, id = rid)
+        else:
+            raise ValueError('invalid parameter type: must be list or dict')
 
     @classmethod
     def from_bytes(cls, data: bytes) -> 'RPCRequest':
@@ -152,10 +147,10 @@ class RPCRequest(Payload):
 
 class RPCResponse(Payload):
     id    : int
-    data  : Optional[Any]
+    data  : Any
     error : Optional[RPCError]
 
-    def __init__(self, id: int, *, data: Optional[Any] = None, error: Optional[RPCError] = None):
+    def __init__(self, id: int, *, data: Any = None, error: Optional[RPCError] = None):
         self.id    = id
         self.data  = data
         self.error = error
@@ -176,7 +171,7 @@ class RPCResponse(Payload):
                 k: v
                 for k, v in (
                     ( 'id'     , self.id   ),
-                    ( 'result' , self.data ),
+                    ( 'result' , self.data or None ),
                     ( 'error'  , self.error and {
                         kk: vv
                         for kk, vv in (
@@ -241,12 +236,17 @@ class SyncResponse(Payload):
         unk, utc_ms = struct.unpack('>QQ', data)
         return SyncResponse(unk, utc_ms)
 
+class SignSuite(IntEnum):
+    Invalid = 0
+    HMAC    = 1
+    MJAC    = 2
+
 class LoginRequest(Payload):
     did  : int
     cert : str
     rand : str
     sign : str
-    algo : list[SignAlgorithm]
+    algo : list[SignSuite]
 
     def __init__(
         self,
@@ -254,7 +254,7 @@ class LoginRequest(Payload):
         cert : str = '',
         rand : str = '',
         sign : bytes = b'',
-        algo : Optional[list[SignAlgorithm]] = None,
+        algo : Optional[list[SignSuite]] = None,
     ):
         self.did  = did
         self.cert = cert
@@ -303,20 +303,26 @@ class LoginRequest(Payload):
         cert = cls.type_checked(obj.get('cert', ''), str)
         rand = cls.type_checked(obj.get('device_random', ''), str)
         sign = base64.b64decode(cls.type_checked(obj.get('sign', ''), str))
-        algo = [SignAlgorithm(cls.type_checked(v, int)) for v in cls.type_checked(obj.get('sign_suites', []), list)]
+        algo = [SignSuite(cls.type_checked(v, int)) for v in cls.type_checked(obj.get('sign_suites', []), list)]
         return cls(did, cert = cert, sign = sign, rand = rand, algo = algo)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> 'LoginRequest':
         return cls.from_json(data.rstrip(b'\x00').decode('utf-8'))
 
+class LoginStatus(IntEnum):
+    Ok      = 0
+    Stage2  = 1
+    Error   = -1
+    NoCode  = 1 << 65
+
 class LoginResponse(Payload):
     msg  : str
     rand : str
     code : LoginStatus
-    algo : SignAlgorithm
+    algo : SignSuite
 
-    def __init__(self, code: LoginStatus, msg: str, algo: SignAlgorithm, rand: str):
+    def __init__(self, code: LoginStatus, msg: str, algo: SignSuite, rand: str):
         self.msg  = msg
         self.algo = algo
         self.code = code
@@ -327,7 +333,7 @@ class LoginResponse(Payload):
             'LoginAck {',
             '    code = %s' % ('(n/a)' if self.code == LoginStatus.NoCode else self.code),
             '    msg  = %s' % repr(self.msg),
-            '    algo = %s' % ('(n/a)' if self.algo == SignAlgorithm.Invalid else self.algo),
+            '    algo = %s' % ('(n/a)' if self.algo == SignSuite.Invalid else self.algo),
             '    rand = %s' % (self.rand or '(empty)'),
             '}',
         ])
@@ -355,8 +361,8 @@ class LoginResponse(Payload):
         obj = json.loads(data)
         msg = cls.type_checked(obj.get('message', ''), str)
         rand = cls.type_checked(obj.get('cloud_random', ''), str)
+        algo = SignSuite(cls.type_checked(obj.get('sign_suite', SignSuite.Invalid), int))
         code = LoginStatus(cls.type_checked(obj.get('code', LoginStatus.NoCode), int))
-        algo = SignAlgorithm(cls.type_checked(obj.get('sign_suite', SignAlgorithm.Invalid), int))
         return cls(code, msg, algo, rand)
 
     @classmethod
@@ -424,7 +430,7 @@ class Packet:
         cert : str = '',
         rand : str = '',
         sign : bytes = b'',
-        algo : Optional[list[SignAlgorithm]] = None,
+        algo : Optional[list[SignSuite]] = None,
     ) -> 'Packet':
         return Packet(PacketType.Login, seq, LoginRequest(did, cert, rand, sign, algo))
 
@@ -472,7 +478,7 @@ class Signature:
         enc.leave()
         return enc.output()
 
-class MiioSecurityProvider:
+class MiotSecurityProvider:
     @property
     def device_id(self) -> int:
         raise NotImplementedError('device_id')
@@ -492,7 +498,7 @@ class MiioSecurityProvider:
     def generate_signature(self, data: bytes) -> Signature:
         raise NotImplementedError('generate_signature()', data)
 
-class MiioMJACSecurityProvider(MiioSecurityProvider):
+class MiotMJACSecurityProvider(MiotSecurityProvider):
     dev: MJAC
 
     def __init__(
@@ -528,18 +534,18 @@ class MiioMJACSecurityProvider(MiioSecurityProvider):
         return Signature(ret[2:34], ret[36:])
 
 class LoginCtx:
-    algo     : SignAlgorithm
-    secp     : MiioSecurityProvider
+    algo     : SignSuite
+    secp     : MiotSecurityProvider
     dev_rand : str
     srv_rand : str
 
-    __algorithms__ = [
-        SignAlgorithm.MJAC,
+    __suites__ = [
+        SignSuite.MJAC,
     ]
 
-    def __init__(self, secp: MiioSecurityProvider):
+    def __init__(self, secp: MiotSecurityProvider):
         self.secp     = secp
-        self.algo     = SignAlgorithm.Invalid
+        self.algo     = SignSuite.Invalid
         self.srv_rand = ''
         self.dev_rand = ''
 
@@ -549,16 +555,16 @@ class LoginCtx:
         return self.dev_rand
 
     def _sign_hmac(self) -> bytes:
-        raise NotImplementedError('HMAC signature algorithm is not supported')
+        raise NotImplementedError('HMAC signature suite is not supported')
 
     def _sign_mjac(self) -> bytes:
         data = self.dev_rand + self.srv_rand
         return self.secp.generate_signature(data.encode('utf-8')).to_asn1()
 
     def sign(self) -> bytes:
-        if self.algo == SignAlgorithm.HMAC:
-            raise NotImplementedError('HMAC signature algorithm is not supported')
-        elif self.algo == SignAlgorithm.MJAC:
+        if self.algo == SignSuite.HMAC:
+            raise NotImplementedError('HMAC signature suite is not supported')
+        elif self.algo == SignSuite.MJAC:
             return self._sign_mjac()
         else:
             raise ValueError('invalid signature algorithm')
@@ -569,7 +575,7 @@ class LoginCtx:
             did  = self.secp.device_id,
             cert = self.secp.vendor_cert + self.secp.device_cert,
             rand = self.next_rand,
-            algo = self.__algorithms__,
+            algo = self.__suites__,
         )
 
     def stage2(self, seq: int) -> LoginRequest:
@@ -590,14 +596,14 @@ class Sender:
     def send_packet(self, packet: Packet):
         raise NotImplementedError('send_packet()', packet)
 
-class MiioRPC:
+class MiotRPC:
     log    : Logger
     incr   : int
     sender : ReferenceType[Sender]
     waiter : dict[int, tuple[Future[RPCResponse], TimerHandle]]
 
     def __init__(self, sender: ReferenceType[Sender]):
-        self.log    = logging.getLogger('miio.rpc')
+        self.log    = logging.getLogger('miot.rpc')
         self.incr   = 0
         self.waiter = {}
         self.sender = sender
@@ -637,91 +643,28 @@ class MiioRPC:
 
         # check if it's a valid response
         if fut is None:
-            self.log.warning('Unexpected RPC response, dropped: ' + repr(p))
+            self.log.warning('Unexpected RPC response, dropped: %r', p)
             return
 
         # cancel the timeout, and resolve the future
         tmr.cancel()
         fut.set_result(p)
 
-class MiioAppConfig:
+class MiotConfiguration:
     args              : list[str]
     uptime            : float
-    app_class         : type['MiioApplication']
-    app_module        : ModuleType
-    security_provider : MiioSecurityProvider
+    app_class         : type['MiotApplication']
+    security_provider : MiotSecurityProvider
 
-    __providers__ = {
-        'mjac': MiioMJACSecurityProvider,
-    }
-
-    __arguments__ = [
-        ('-m', '--app', dict(
-            type     = str,
-            help     = 'path of the application module',
-            required = True,
-        )),
-        ('-c', '--class', dict(
-            type     = str,
-            dest     = 'klass',
-            help     = 'name of the application class',
-            default  = 'MiioApp',
-            required = False,
-        )),
-        ('-p', '--security-provider', dict(
-            type     = str,
-            help     = 'security provider name',
-            default  = 'mjac',
-            choices  = __providers__,
-            required = False,
-        )),
-        ('args', dict(
-            help    = 'arguments passed to application',
-            nargs   = '*',
-            metavar = 'ARGS',
-        ))
-    ]
-
-    def __init__(self, *args: str):
-        self.uptime = time.monotonic()
-        self._parse(args[1:])
-
-    def _parse(self, args: Sequence[str]):
-        d = self.__arguments__
-        p = argparse.ArgumentParser(description = 'MiIO Client v1.0')
-
-        # add argumnets
-        for v in d:
-            p.add_argument(*v[:-1], **v[-1])
-
-        # parse the args
-        ns = p.parse_args(args)
-        app, cls, secp = ns.app, ns.klass, ns.security_provider
-
-        # load the module
-        spec = importlib.util.spec_from_file_location('miio_app', app)
-        smod = importlib.util.module_from_spec(spec)
-
-        # insert into modules
-        sys.modules['miio_app'] = smod
-        spec.loader.exec_module(smod)
-
-        # find the class
-        try:
-            self.app_class = getattr(smod, cls)
-        except AttributeError:
-            print('* error: class not found: %s:%s' % (app, cls))
-            sys.exit(1)
-
-        # check for subclass
-        if not isinstance(self.app_class, type) or not issubclass(self.app_class, MiioApplication):
-            print('* error: application must be a subclass of MiioApplication: %s:%s' % (app, cls))
-            sys.exit(1)
-
-        # set the app module and security provider
-        self.args = ns.args
-        self.app_module = smod
-        self.security_provider = self.__providers__[secp]()
+    def __init__(self,
+        app_class         : type['MiotApplication'],
+        security_provider : Optional[MiotSecurityProvider] = None,
+        *args             : str,
+    ):
+        self.args              = list(args)
+        self.uptime            = time.monotonic()
+        self.app_class         = app_class
+        self.security_provider = security_provider or MiotMJACSecurityProvider()
 
     async def resolve(self, dns: str = 'dns.io.mi.com', host: str = 'ots.io.mi.com') -> tuple[str, int]:
         resp = requests.get(
@@ -750,7 +693,7 @@ class MiioAppConfig:
         addr = resp['info']['host_list'][0]
         return addr['ip'], addr['port']
 
-    async def connect(self, host: str = 'ots.io.mi.com', port: int = 443, **kwargs) -> 'MiioConnection':
+    async def connect(self, host: str = 'ots.io.mi.com', port: int = 443, **kwargs) -> 'MiotConnection':
         kwargs.pop('cafile', None)
         kwargs.pop('capath', None)
         kwargs['cadata'] = self.security_provider.root_cert
@@ -762,10 +705,10 @@ class MiioAppConfig:
 
         # connect to MiIO OT server
         rd, wr = await asyncio.open_connection(host, port, ssl = ctx)
-        return MiioConnection(rd, wr, ctx, cfg = self)
+        return MiotConnection(rd, wr, ctx, cfg = self)
 
-class MiioApplication:
-    def __init__(self, rpc: MiioRPC, cfg: MiioAppConfig):
+class MiotApplication:
+    def __init__(self, rpc: MiotRPC, cfg: MiotConfiguration):
         raise NotImplementedError('__init__()', rpc, cfg)
 
     @classmethod
@@ -778,26 +721,26 @@ class MiioApplication:
     async def handle_request(self, p: RPCRequest):
         raise NotImplementedError('async handle_request()', p)
 
-class MiioConnection(Sender):
+class MiotConnection(Sender):
     rd    : StreamReader
     wr    : StreamWriter
-    app   : MiioApplication
+    app   : MiotApplication
     seq   : int
     log   : Logger
-    rpc   : MiioRPC
+    rpc   : MiotRPC
     ctx   : SSLContext
-    cfg   : MiioAppConfig
+    cfg   : MiotConfiguration
     state : str
     login : LoginCtx
 
-    def __init__(self, rd: StreamReader, wr: StreamWriter, ctx: SSLContext, cfg: MiioAppConfig):
+    def __init__(self, rd: StreamReader, wr: StreamWriter, ctx: SSLContext, cfg: MiotConfiguration):
         self.rd    = rd
         self.wr    = wr
         self.seq   = -1
         self.cfg   = cfg
         self.ctx   = ctx
-        self.log   = logging.getLogger('miio')
-        self.rpc   = MiioRPC(ReferenceType(self))
+        self.log   = logging.getLogger('miot')
+        self.rpc   = MiotRPC(ReferenceType(self))
         self.app   = cfg.app_class(self.rpc, cfg)
         self.state = 'login_1'
         self.login = LoginCtx(cfg.security_provider)
@@ -809,19 +752,19 @@ class MiioConnection(Sender):
     def send_packet(self, p: Packet):
         t = time.monotonic_ns()
         self.wr.write(p.to_bytes())
-        self.log.debug('Packet %s with Seq %d was transmitted in %.3fms' % (p.ty.name, p.seq, (time.monotonic_ns() - t) / 1e6))
+        self.log.debug('Packet %s with Seq %d was transmitted in %.3fms.', p.ty.name, p.seq, (time.monotonic_ns() - t) / 1e6)
 
     async def _timesync(self):
         while True:
             dt = time.monotonic() - self.cfg.uptime
-            self.log.debug('Time-sync with uptime %.3fs' % dt)
+            self.log.debug('Time-sync with uptime %.3fs.', dt)
             self.send_packet(Packet.sync(self.next_seq(), int(dt * 1000)))
             await asyncio.sleep(TIMESYNC_INTERVAL)
 
     async def _heartbeat(self):
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
-            self.log.debug('Keep alive')
+            self.log.debug('Keep alive.')
             self.send_packet(Packet.keepalive(self.next_seq()))
 
     async def _login_poller(self):
@@ -859,7 +802,7 @@ class MiioConnection(Sender):
             case PacketType.RPCAck:
                 self.rpc.handle_response(p.data)
             case PacketType.SyncAck:
-                self.log.debug('Time-sync from server. utc_ms = %d' % p.data.utc_ms)
+                self.log.debug('Time-sync from server. utc_ms = %d', p.data.utc_ms)
             case PacketType.KeepaliveAck:
                 self.log.debug('Keep-alive from server.')
             case PacketType.LoginAck:
@@ -873,7 +816,7 @@ class MiioConnection(Sender):
                             self.log.warning('Login failure, retry after 1 second: unknown error')
                         else:
                             self.state = 'retry_login_1'
-                            self.log.warning('Login failure, retry after 1 second: %s: %s' % (p.data.code, p.data.msg))
+                            self.log.warning('Login failure, retry after 1 second: %s: %s', p.data.code, p.data.msg)
                     case 'wait_login_2':
                         if p.data.code == LoginStatus.Ok:
                             self.state = 'online'
@@ -883,16 +826,16 @@ class MiioConnection(Sender):
                             self.log.warning('Login failure, retry after 1 second: unknown error')
                         else:
                             self.state = 'retry_login_1'
-                            self.log.warning('Login failure, retry after 1 second: %s: %s' % (p.data.code, p.data.msg))
+                            self.log.warning('Login failure, retry after 1 second: %s: %s', p.data.code, p.data.msg)
                     case state:
                         self.log.warning('LoginAck at the wrong state (%s), dropped.' % state)
             case _:
-                self.log.warning('Unexpected packet, dropped. packet = %s' % p)
+                self.log.warning('Unexpected packet, dropped: %r', p)
 
     async def _network_receiver(self):
         while True:
             p = await Packet.read_from(self.rd)
-            self.log.debug('Received %s packet with Seq %d' % (p.ty.name, p.seq))
+            self.log.debug('Received %s packet with Seq %d.', p.ty.name, p.seq)
             await self._network_handler(p)
 
     async def run_forever(self):
@@ -905,3 +848,81 @@ class MiioConnection(Sender):
                 asyncio.ensure_future(self._network_receiver()),
             ],
         )
+
+class MiotAppLoader:
+    __providers__ = {
+        'mjac': MiotMJACSecurityProvider,
+    }
+
+    __arguments__ = [
+        ('-m', '--app', dict(
+            type     = str,
+            help     = 'path of the application module',
+            required = True,
+        )),
+        ('-c', '--class', dict(
+            type     = str,
+            dest     = 'klass',
+            help     = 'name of the application class',
+            default  = 'MiotApp',
+            required = False,
+        )),
+        ('-p', '--security-provider', dict(
+            type     = str,
+            help     = 'security provider name',
+            default  = 'mjac',
+            choices  = __providers__,
+            required = False,
+        )),
+        ('args', dict(
+            help    = 'arguments passed to application',
+            type    = str,
+            nargs   = '*',
+            metavar = 'ARGS',
+        ))
+    ]
+
+    @classmethod
+    async def main(cls, args: Sequence[str]):
+        d = cls.__arguments__
+        p = argparse.ArgumentParser(description = 'MiIO Client v1.0')
+
+        # add argumnets
+        for v in d:
+            p.add_argument(*v[:-1], **v[-1])
+
+        # parse the args
+        ns = p.parse_args(args)
+        mod, klass, secp = ns.app, ns.klass, ns.security_provider
+
+        # load the module
+        spec = importlib.util.spec_from_file_location('miot_app', mod)
+        smod = importlib.util.module_from_spec(spec)
+
+        # insert into modules
+        sys.modules['miot_app'] = smod
+        spec.loader.exec_module(smod)
+
+        # find the class
+        try:
+            app_class = getattr(smod, klass)
+        except AttributeError:
+            print('* error: class not found: %s:%s' % (mod, klass))
+            sys.exit(1)
+
+        # check for subclass
+        if not isinstance(app_class, type) or not issubclass(app_class, MiotApplication):
+            print('* error: application must be a subclass of MiotApplication: %s:%s' % (mod, klass))
+            sys.exit(1)
+
+        # construct the configuration
+        cfg = MiotConfiguration(
+            app_class,
+            cls.__providers__[secp](),
+            *ns.args,
+        )
+
+        # start the connection
+        addr = await cfg.resolve()
+        conn = await cfg.connect(*addr)
+        await conn.run_forever()

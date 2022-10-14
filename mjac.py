@@ -165,8 +165,8 @@ class MJAC:
 
         # initialize I2C device and GPIO port
         self._rst = 1 << rst_pin
-        self._dev = i2c.get_port(i2c_addr)
         self._pin = i2c.get_gpio()
+        self._dev = i2c.get_port(i2c_addr)
 
         # set the RST pin as output
         self._pin.set_direction(self._rst, self._rst)
