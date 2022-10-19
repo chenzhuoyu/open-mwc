@@ -45,7 +45,7 @@ from miot import MiotRPC
 from miot import MiotApplication
 from miot import MiotConfiguration
 
-from disco import Configuration as DiscoConfiguration
+from disco import Configuration
 
 HW_VER       = 'Linux'
 FW_VER       = '4.1.6_1999'
@@ -249,70 +249,28 @@ class KeyStore:
         kbuf[seed] = skey
         return seed, skey
 
-class ApSettings:
-    ssid   : str
-    passwd : str
-
-    def __init__(self, ssid: str, passwd: str):
-        self.ssid   = ssid
-        self.passwd = passwd
-
-    @classmethod
-    def from_dict(cls, cfg: dict[str, Any]) -> 'ApSettings':
-        return cls(
-            ssid   = Payload.type_checked(cfg['ssid'], str),
-            passwd = Payload.type_checked(cfg['passwd'], str),
-        )
-
-class Settings:
-    ap     : ApSettings
-    device : DiscoConfiguration
-
-    def __init__(self, ap: ApSettings, device: DiscoConfiguration):
-        self.ap     = ap
-        self.device = device
-
-    @classmethod
-    def load(cls, args: Sequence[str]) -> 'Settings':
-        p = argparse.ArgumentParser('mwc10')
-        p.add_argument('-c', '--config', metavar = 'FILE', type = str, help = 'config file path', default = 'miio.json')
-
-        # read and parse the file
-        with open(p.parse_args(args).config) as fp:
-            try:
-                return cls.from_dict(Payload.type_checked(json.load(fp), dict))
-            except KeyError as e:
-                raise RuntimeError(
-                    '\n'.join([
-                        'missing configuration section "%s".' % e.args[0],
-                        '',
-                        '    Please run "./mwc10.py config" to perform initialization first.',
-                        '',
-                    ]
-                )) from None
-
-    @classmethod
-    def from_dict(cls, cfg: dict[str, Any]) -> 'Settings':
-        return cls(
-            ap     = ApSettings.from_dict(Payload.type_checked(cfg['ap'], dict)),
-            device = DiscoConfiguration.from_dict(Payload.type_checked(cfg['device'], dict)),
-        )
-
 class MiotApp(MiotApplication):
     did       : int
     log       : Logger
     rpc       : MiotRPC
-    cfg       : Settings
+    cfg       : Configuration
     keys      : KeyStore
     uptime    : int
     gw_props  : GatewayProperties
     cam_props : dict[str, CameraProperties]
 
     def __init__(self, rpc: MiotRPC, cfg: MiotConfiguration):
+        p = argparse.ArgumentParser('mwc10')
+        p.add_argument('-c', '--config', metavar = 'FILE', type = str, help = 'config file path', default = 'mwc10.json')
+
+        # read and parse the file
+        with open(p.parse_args(cfg.args).config) as fp:
+            self.cfg = Configuration.from_dict(Payload.type_checked(json.load(fp), dict))
+
+        # initialize remaining properties
         self.rpc       = rpc
         self.did       = cfg.security_provider.device_id
         self.log       = logging.getLogger('mwc10')
-        self.cfg       = Settings.load(cfg.args)
         self.keys      = KeyStore()
         self.uptime    = cfg.uptime
         self.gw_props  = GatewayProperties()
@@ -357,13 +315,13 @@ class MiotApp(MiotApplication):
                 MemFree         = 0,
                 miio_times      = [0] * 4,
                 ap              = {
-                    'ssid'  : 'Wired Ethernet',
-                    'bssid' : 'FF:FF:FF:FF:FF:FF',
-                    'rssi'  : '0',
+                    'ssid'  : self.cfg.ap.ssid,
+                    'bssid' : '11:22:33:44:55:66',
+                    'rssi'  : '-40',
                     'freq'  : 2412,
                 },
                 netif           = {
-                    'localIp' : '172.20.0.226',
+                    'localIp' : '172.20.0.1',
                     'mask'    : '255.255.255.0',
                     'gw'      : '172.20.0.254'
                 },
@@ -405,8 +363,8 @@ class MiotApp(MiotApplication):
         data = json.dumps(
             separators = (',', ':'),
             obj        = {
-                'ssid'           : self.cfg.ap_ssid,
-                'passwd'         : self.cfg.ap_passwd,
+                'ssid'           : self.cfg.ap.ssid,
+                'passwd'         : self.cfg.ap.passwd,
                 'static_key'     : mkey,
                 'static_key_num' : seed,
             },
@@ -415,7 +373,7 @@ class MiotApp(MiotApplication):
         # generate and exchange keys with ECDH, and derive the encryption key with HKDF
         nkey = generate_private_key(SECP256R1())
         skey = nkey.exchange(ECDH(), EllipticCurvePublicKey.from_encoded_point(SECP256R1(), pkey))
-        aesc = Cipher(AES128(HKDF(SHA256(), 16, Settings.device_oob, b'').derive(skey)), CBC(bytes(16))).encryptor()
+        aesc = Cipher(AES128(HKDF(SHA256(), 16, self.cfg.device.oob, b'').derive(skey)), CBC(bytes(16))).encryptor()
 
         # encrypt the response data
         data = data.encode('utf-8')
@@ -481,49 +439,3 @@ class MiotApp(MiotApplication):
         'get_gwinfo'     : _rpc_get_gwinfo,
         'get_properties' : _rpc_get_properties,
     }
-
-def config(args: Sequence[str]):
-    p = argparse.ArgumentParser('%s config' % sys.argv[0])
-    p.add_argument('-c', '--config', metavar = 'CFG', type = str, help = 'config file path', default = 'miio.json')
-    p.add_argument('action', type = str, nargs = '*')
-
-    # parse the arguments
-    ns = p.parse_args(args)
-    fname, action = ns.config, ns.action
-
-    # check for action
-    if not action:
-        usage()
-    else:
-        cmd, *args = action
-
-    # load and update the current config
-    try:
-        with open(fname) as fp:
-            cfg = Payload.type_checked(json.load(fp), dict)
-    except (TypeError, FileNotFoundError):
-        cfg = {}
-
-    # check for module name
-    match (cmd, len(args)):
-        case ('ap', 2) : cfg['ap'] = { 'ssid': args[0], 'passwd': args[1] }
-        case _         : usage()
-
-    # save the new configuration if modified
-    with open(ns.config, 'w') as fp:
-        json.dump(cfg, fp, indent = 4)
-
-def usage():
-    print('usage: %s config [-h] [-c CFG] ap <ssid> <passwd>' % sys.argv[0], file = sys.stderr)
-    sys.exit(1)
-
-def main():
-    if len(sys.argv) < 2:
-        usage()
-    else:
-        match sys.argv[1]:
-            case 'config' : config(sys.argv[2:])
-            case _        : usage()
-
-if __name__ == '__main__':
-    main()

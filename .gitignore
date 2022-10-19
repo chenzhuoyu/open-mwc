@@ -1,5 +1,6 @@
 /.vscode/
-*.bin
+/mwc11proxy/target/
+.DS_Store
 *.pyc
 *.hevc
 *.json

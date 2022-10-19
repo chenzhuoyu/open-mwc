@@ -100,12 +100,16 @@ class RPCRequest(Payload):
         self.args   = args or {}
         self.method = method
 
+    @property
+    def _readable_args(self) -> str:
+        return ('\n' + ' ' * 4).join(json.dumps(self.args, indent = 4, sort_keys = True).splitlines())
+
     def __repr__(self) -> str:
         return '\n'.join([
             'RPCRequest {',
             '    id     = %d' % self.id,
             '    method = %s' % self.method,
-            '    args   = %s' % ('\n' + ' ' * 4).join(json.dumps(self.args, indent = 4).splitlines()),
+            '    args   = %s' % self._readable_args,
             '}',
         ])
 
@@ -116,8 +120,8 @@ class RPCRequest(Payload):
                 k: v
                 for k, v in (
                     ( 'id'     , self.id           ),
-                    ( 'params' , self.args or None ),
                     ( 'method' , self.method       ),
+                    ( 'params' , self.args or None ),
                 )
                 if v is not None
             }
@@ -155,11 +159,15 @@ class RPCResponse(Payload):
         self.data  = data
         self.error = error
 
+    @property
+    def _readable_data(self) -> str:
+        return ('\n' + ' ' * 4).join(json.dumps(self.data, indent = 4, sort_keys = True).splitlines())
+
     def __repr__(self) -> str:
         return ''.join([
             'RPCResponse {\n',
             '    id    = %d\n' % self.id,
-            self.data and '    data  = %s\n' % ('\n' + ' ' * 4).join(json.dumps(self.data, indent = 4).splitlines()) or '',
+            self.data and '    data  = %s\n' % self._readable_data or '',
             self.error and '    error = %s\n' % self.error or '',
             '}',
         ])

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import json
+import base64
 import socket
 import struct
 import hashlib
@@ -9,16 +11,18 @@ import hexdump
 import logging
 import coloredlogs
 
+from udp import UdpSocket
 from enum import IntEnum
 from logging import Logger
 
-from typing import List
-from typing import Tuple
-from typing import Union
+from miot import Payload
+
+from typing import Any
 from typing import Iterable
 from typing import Optional
 
 from asyncio import Queue
+from asyncio import TimerHandle
 from asyncio import StreamReader
 from asyncio import StreamWriter
 
@@ -31,15 +35,13 @@ from cryptography.hazmat.primitives.ciphers.algorithms import AES128
 LOG_FMT         = '%(asctime)s %(name)s [%(levelname)s] %(message)s'
 LOG_LEVEL       = logging.DEBUG
 
-DEVICE_CHAN     = 0
-SERVER_ADDR     = '192.168.99.1'
+MUX_TIMEOUT     = 10
 PROTOCOL_VER    = 2
 
 DSP_COMM_PORT   = 32290
 COM_SEND_PORT   = 32293
 COM_RECV_PORT   = 32295
 UDP_COMM_PORT   = 32392
-SPEED_TEST_PORT = 5001
 VIDEO_FEED_PORT = 32380
 
 SECRET_MAGIC    = 0xee00ff11
@@ -167,7 +169,7 @@ class PacketCmd(IntEnum):
     PIRDelay                        = 0x39
     GetPIRDelay                     = 0x3a
     SetTamperState                  = 0x3b
-    RequestUSBState                 = 0x3c  # 0x4ea5
+    RequestUSBState                 = 0x3c
     GetTamperState                  = 0x3d
     SetTamperWakeup                 = 0x3e
     GetDeviceTemperature            = 0x3f
@@ -206,61 +208,82 @@ class PacketCmd(IntEnum):
     BindResult                      = 0x12e
     StaticIPAssigned                = 0x12f
 
-class Secret:
-    model       : str
-    auth_key    : bytes
-    session_key : List[bytes]
-    mac         : List[bytes]
-    traid_info  : List[str]
-    static_num  : List[int]
+class Key:
+    num: int
+    oob: str
+    key: bytes
+
+    def __init__(self, key: bytes, oob: str, num: int):
+        self.key = key
+        self.oob = oob
+        self.num = num
 
     def __repr__(self) -> str:
         return '\n'.join([
-            'Secret {',
-            '    model       : ' + self.model,
-            '    auth_key    : ' + self.auth_key.hex(' '),
-            '    session_key : {',
-        ] + [
-            '        [%2d] = %s' % (i, v.hex(' '))
-            for i, v in enumerate(self.session_key)
-        ] + [
-            '    }',
-            '    mac : {',
-        ] + [
-            '        [%2d] = %s' % (i, v.hex(':'))
-            for i, v in enumerate(self.mac)
-        ] + [
-            '    }',
-            '    traid_info : {',
-        ] + [
-            '        [%2d] = %s' % (i, v)
-            for i, v in enumerate(self.traid_info)
-        ] + [
-            '    }',
-            '    static_num : {',
-        ] + [
-            '        [%2d] = 0x%08x' % (i, v)
-            for i, v in enumerate(self.static_num)
-        ] + [
-            '    }',
-            '}'
+            'Key {',
+            '    key = %s' % self.key.hex(),
+            '    oob = %s' % self.oob,
+            '    num = %d' % self.num,
+            '}',
         ])
 
-    def _cipher(self, chan: int) -> Cipher:
-        return Cipher(AES128(self.session_key[chan]), CBC(bytes(16)))
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'num': self.num,
+            'oob': self.oob,
+            'key': base64.b64encode(self.key).decode('utf-8'),
+        }
 
-    def _transform(self, ctx: CipherContext, data: bytes) -> bytes:
-        return ctx.update(data) + ctx.finalize()
+    def encrypt(self, data: bytes) -> bytes:
+        pad = (16 - len(data) % 16) % 16
+        aes = Cipher(AES128(self.key), CBC(bytes(16))).encryptor()
+        return aes.update(data) + aes.update(b'\x00' * pad) + aes.finalize()
 
-    def encrypt(self, chan: int, data: bytes) -> bytes:
-        data = data.ljust(((len(data) - 1 >> 4) + 1 << 4), b'\0')
-        return self._transform(self._cipher(chan).encryptor(), data)
+    def decrypt(self, data: bytes, size: int) -> bytes:
+        aes = Cipher(AES128(self.key), CBC(bytes(16))).decryptor()
+        buf = aes.update(data) + aes.finalize()
+        return buf[:size]
 
-    def decrypt(self, chan: int, data: bytes, size: int) -> bytes:
-        return self._transform(self._cipher(chan).decryptor(), data)[:size]
+    def unbind_token(self,  addr: str, port: int) -> bytes:
+        return hashlib.md5(self.encrypt(socket.inet_aton(addr) + port.to_bytes(2, 'little'))).digest()
 
-    def calc_unbind_token(self, chan: int, addr: str, port: int) -> bytes:
-        return hashlib.md5(self.encrypt(chan, socket.inet_aton(addr) + port.to_bytes(2, 'little'))).digest()
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> 'Key':
+        return cls(
+            num = Payload.type_checked(data['num'], 'int'),
+            oob = Payload.type_checked(data['oob'], 'str'),
+            key = base64.b64decode(Payload.type_checked(data['key'], 'str').encode('utf-8')),
+        )
+
+class KeyStore:
+    file: str
+    keys: dict[str, Key]
+
+    def __init__(self, keys: dict[str, Key], *, file: str = 'mwc11.json'):
+        self.file = file
+        self.keys = keys
+
+    def save(self):
+        with open(self.file, 'w') as fp:
+            json.dump(self, fp, indent = 4, sort_keys = True)
+
+    def find(self, addr: str) -> Optional[Key]:
+        return self.keys.get(addr)
+
+    def update(self, addr: str, key: Key):
+        self.keys[addr] = key
+        self.save()
+
+    @classmethod
+    def load(cls, file: str = 'mwc11.json') -> 'KeyStore':
+        try:
+            with open(file) as fp:
+                data = Payload.type_checked(json.load(fp), dict)
+                keys = { k: Key.from_dict(Payload.type_checked(v, dict)) for k, v in data.items() }
+        except (TypeError, ValueError, FileNotFoundError):
+            return cls({}, file = file)
+        else:
+            return cls(keys, file = file)
 
 class Frame:
     type    : FrameCmd
@@ -309,22 +332,15 @@ class Packet:
     def _dump_data(self) -> str:
         return ('\n' + ' ' * 12).join(hexdump.hexdump(self.data, result = 'generator'))
 
-class StreamSerdes:
-    rbuf   : bytes
-    secret : Secret
-
-    def __init__(self, secret: Secret):
-        self.rbuf   = b''
-        self.secret = secret
-
-    def _decode_iter(self, chan: int) -> Iterable[Frame]:
-        while len(self.rbuf) >= 24:
-            buf = self.rbuf[:24]
-            magic, ty, seq, size = struct.unpack('IxBH4xH10x', buf)
+class FrameSerdes:
+    def decode(self, buf: bytes, key: Key) -> Iterable[Frame]:
+        while len(buf) >= 24:
+            hdr = buf[:24]
+            magic, ty, seq, size = struct.unpack('IxBH4xH10x', hdr)
 
             # check for magic number
             if magic != STREAM_MAGIC:
-                raise ValueError('invalid packet header: ' + buf.hex(' '))
+                raise ValueError('invalid packet header: ' + hdr.hex(' '))
 
             # calculate padded size
             if not (size & 0x0f):
@@ -333,32 +349,21 @@ class StreamSerdes:
                 rlen = (size & 0xfff0) + 0x10
 
             # check for buffer length
-            if len(self.rbuf) < rlen + 24:
-                break
+            if len(buf) < rlen + 24:
+                raise ValueError('incomplete packet')
 
             # read the encrypted data if any
             if not rlen:
                 rbuf = b''
             else:
-                rbuf = self.secret.decrypt(chan, self.rbuf[24:rlen + 24], size)
+                rbuf = key.decrypt(buf[24:rlen + 24], size)
 
             # construct the packet
+            buf = buf[rlen + 24:]
             yield Frame(FrameCmd(ty), seq, rbuf)
-            self.rbuf = self.rbuf[rlen + 24:]
-
-    def decode(self, buf: bytes, chan: int) -> Iterable[Frame]:
-        self.rbuf += buf
-        yield from self._decode_iter(chan)
 
 class PacketSerdes:
-    log    : Logger
-    secret : Secret
-
-    def __init__(self, secret: Secret):
-        self.log    = logging.getLogger('mwc11.serdes')
-        self.secret = secret
-
-    async def read(self, rd: StreamReader, chan: int) -> Packet:
+    async def read(self, rd: StreamReader, key: Optional[Key] = None) -> Packet:
         data = await rd.readexactly(4)
         magic, = struct.unpack('I', data)
 
@@ -373,7 +378,7 @@ class PacketSerdes:
 
         # check for skipped garbage data
         if len(data) != 4:
-            self.log.warning(
+            logging.getLogger('mwc11.serdes').warning(
                 'Skipping garbage data:\n' +
                 ('\n' + ' ' * 4).join(hexdump.hexdump(data[:-4], result = 'generator'))
             )
@@ -383,6 +388,7 @@ class PacketSerdes:
         cmd, size, ver = struct.unpack('III', data[:12])
 
         # command and signature
+        ext = b''
         sig = data[16:]
         cmd = PacketCmd(cmd)
 
@@ -394,15 +400,20 @@ class PacketSerdes:
         if cmd == PacketCmd.StaticIPAssigned:
             return Packet(ver, cmd, sig, await rd.readexactly(size))
 
+        # special case of the initial key exchange packet
+        if cmd == PacketCmd.ExchangeBindInfo:
+            ext = await rd.readexactly(140)
+            key, size = Key(ext[:16], '', 0), struct.unpack('136xI', ext)[0]
+
         # add padding size, read and decrypt the body
         rbuf = await rd.readexactly((((size - 1) >> 4) + 1) << 4)
-        return Packet(ver, cmd, sig, self.secret.decrypt(chan, rbuf, size))
+        return Packet(ver, cmd, sig, ext + (key.decrypt(rbuf, size) if key else rbuf))
 
-    async def write(self, wr: StreamWriter, chan: int, frame: Packet):
+    async def write(self, wr: StreamWriter, key: Key, frame: Packet):
         await wr.write(b''.join((
             struct.pack('IIII', SENDER_MAGIC, frame.cmd, len(frame.data), frame.ver),
             frame.token,
-            self.secret.encrypt(chan, frame.data),
+            key.encrypt(frame.data),
         )))
 
 class FrameDemux:
@@ -462,175 +473,159 @@ class FrameDemux:
         self._handle_signaling_frame(frame)
         self.frames.put_nowait(frame)
 
-class MiCameraHandler:
-    sbuf  : Queue
-    token : bytes
+class Connection:
+    log      : Logger
+    key      : Optional[Key]
+    keys     : KeyStore
+    dmux     : FrameDemux
+    udps     : FrameSerdes
+    srds     : PacketSerdes
+    com_recv : Optional[StreamReader]
+    com_send : Optional[StreamWriter]
+    dsp_comm : Optional[StreamWriter]
+    udp_comm : Optional[StreamWriter]
 
-    def __init__(self):
-        self.sbuf  = Queue()
-        self.token = b''
+    def __init__(self, addr: str, keys: KeyStore):
+        self.key      = keys.find(addr)
+        self.log      = logging.getLogger('mwc11.conn.' + addr.replace('.', '_'))
+        self.keys     = keys
+        self.dmux     = FrameDemux()
+        self.udps     = FrameSerdes()
+        self.srds     = PacketSerdes()
+        self.com_recv = None
+        self.com_send = None
+        self.dsp_comm = None
+        self.udp_comm = None
 
-    def send(self, cmd: IntEnum, data: bytes):
-        self.sbuf.put_nowait(Packet(PROTOCOL_VER, cmd, self.token, data))
+    @property
+    def ready(self) -> bool:
+        return self.com_send is not None and self.com_recv is not None
 
-    async def handle_frame(self, frame: Frame):
-        if frame.type == FrameCmd.VideoHEVC:
-            self._vfp.write(frame.payload)
+    def close(self):
+        for conn in (self.com_send, self.dsp_comm, self.udp_comm):
+            if conn is not None:
+                conn.close()
+
+    def handle_udp(self, data: bytes):
+        if self.key is None:
+            self.log.warning('Dropping UDP packets: key is not initialized.')
         else:
-            print(frame)
+            for frame in self.udps.decode(data, self.key):
+                self.dmux.add_streaming_frame(frame)
 
-    async def handle_packet(self, frame: Packet):
-        if frame.cmd == PacketCmd.StopStream:
-            self._vfp.close()
-        elif frame.cmd == PacketCmd.StartStream:
-            self._vfp = open('test.hevc', 'wb')
-        else:
-            print(frame)
+    async def connection_ready(self):
+        while self.key is None:
+            req = await self.srds.read(self.com_recv)
+            cmd = req.cmd
 
-class MiCameraStation:
-    rbuf: FrameDemux
-    udps: StreamSerdes
-    srds: PacketSerdes
-    conn: Optional[MiCameraHandler]
+    async def _perform_handshake(self):
+        pass
 
-    class VideoHandler(asyncio.DatagramProtocol):
-        conn: 'MiCameraStation'
-        port: Optional[asyncio.DatagramTransport]
+    async def _dispatch_requests(self):
+        pass
 
-        def __init__(self, conn: 'MiCameraStation'):
-            self.conn = conn
-            self.port = None
+class MWC11:
+    log    : Logger
+    keys   : KeyStore
+    conn   : dict[str, Connection]
+    waiter : dict[str, tuple[TimerHandle, Connection]]
 
-        def connection_made(self, port: asyncio.DatagramTransport):
-            self.port = port
-
-        def datagram_received(self, data: bytes, _: Tuple[str, int]):
-            for v in self.conn.udps.decode(data, DEVICE_CHAN):
-                self.conn.rbuf.add_streaming_frame(v)
-
-    def __init__(self, secret: Secret):
-        self.rbuf = FrameDemux()
-        self.udps = StreamSerdes(secret)
-        self.srds = PacketSerdes(secret)
-        self.conn = MiCameraHandler()
+    def __init__(self, keys: KeyStore):
+        self.log    = logging.getLogger('mwc10.station')
+        self.keys   = keys
+        self.conn   = {}
+        self.waiter = {}
 
     async def serve_forever(self, host: str = '0.0.0.0'):
         loop = asyncio.get_running_loop()
+        udps = await UdpSocket.new((host, VIDEO_FEED_PORT))
         dspr = await asyncio.start_server(self._serve_dsp_comm, host = host, port = DSP_COMM_PORT)
-        udpr = await asyncio.start_server(self._serve_udp_comm, host = host, port = UDP_COMM_PORT)
+        udpc = await asyncio.start_server(self._serve_udp_comm, host = host, port = UDP_COMM_PORT)
         send = await asyncio.start_server(self._serve_com_send, host = host, port = COM_SEND_PORT)
         recv = await asyncio.start_server(self._serve_com_recv, host = host, port = COM_RECV_PORT)
-
-        # create the video feed socket
-        await loop.create_datagram_endpoint(
-            local_addr       = (host, VIDEO_FEED_PORT),
-            protocol_factory = lambda: self.VideoHandler(self),
-        )
 
         # wait for all services
         await asyncio.wait(
             return_when = asyncio.FIRST_COMPLETED,
             fs          = [
                 loop.create_task(dspr.serve_forever()),
-                loop.create_task(udpr.serve_forever()),
+                loop.create_task(udpc.serve_forever()),
                 loop.create_task(send.serve_forever()),
                 loop.create_task(recv.serve_forever()),
-                loop.create_task(self._dispatch_frames()),
+                loop.create_task(self._dispatch_udp_packets(udps)),
             ],
         )
 
+    def _add_conn(self, addr: str) -> Connection:
+        con = Connection(addr, self.keys)
+        tmr = asyncio.get_running_loop().call_later(MUX_TIMEOUT, self._cancel_conn, addr)
+        self.waiter[addr] = (tmr, con)
+        return con
+
+    def _cancel_conn(self, addr: str):
+        buf = self.waiter
+        tmr, conn = buf.pop(addr, (None, None))
+
+        # drop the connection if needed
+        if tmr and conn:
+            tmr.cancel()
+            conn.close()
+            self.log.error('Aggregation timeout, connection "%s" was dropped.', addr)
+
+    def _dispatch_conn(self, kind: str, wr: StreamWriter, attr: str, value: Any):
+        addr = wr.transport.get_extra_info('peername')[0]
+        conn = self.conn.get(addr)
+
+        # if not found, attempt to find a pending connection
+        if conn is None:
+            _, conn = self.waiter.get(addr, (None, None))
+
+        # if still not found, create a new connection
+        if conn is None:
+            conn = self._add_conn(addr)
+            self.log.info('New connection "%s".', addr)
+
+        # update the attribute
+        setattr(conn, attr, value)
+        self.log.info('Link %s connection to "%s".', kind, addr)
+
+        # check if the connection is ready
+        if not conn.ready:
+            return
+        else:
+            self.log.info('Connection "%s" is ready.', addr)
+
+        # remove the connection from pending list into connection list
+        tmr, conn = self.waiter.pop(addr)
+        self.conn[addr] = conn
+
+        # notify the connection
+        tmr.cancel()
+        asyncio.create_task(conn.connection_ready())
+
     async def _serve_dsp_comm(self, _: StreamReader, wr: StreamWriter):
-        pass  # TODO: handle DspCommSvr logic
+        self._dispatch_conn('DSP Signaling', wr, 'dsp_comm', wr)
 
     async def _serve_udp_comm(self, _: StreamReader, wr: StreamWriter):
-        pass  # TODO: handle UDPComSvr logic
+        self._dispatch_conn('Upstream Audio', wr, 'udp_comm', wr)
 
     async def _serve_com_send(self, _: StreamReader, wr: StreamWriter):
-        _, port = wr.transport.get_extra_info('peername')
-        self.conn.token = self.srds.secret.calc_unbind_token(DEVICE_CHAN, SERVER_ADDR, port)
+        self._dispatch_conn('Upstream Signaling', wr, 'com_send', wr)
 
-        # poll for frames
+    async def _serve_com_recv(self, rd: StreamReader, wr: StreamWriter):
+        self._dispatch_conn('Downstream Signaling', wr, 'com_recv', rd)
+
+    async def _dispatch_udp_packets(self, udp: UdpSocket):
         while True:
-            fr = await self.conn.sbuf.get()
-            await self.srds.write(wr, fr)
+            data, addr = await udp.recvfrom()
+            addr, port = addr
 
-    async def _serve_com_recv(self, rd: StreamReader, _: StreamWriter):
-        try:
-            while True:
-                fr = await self.srds.read(rd, DEVICE_CHAN)
-                self.rbuf.add_signaling_frame(fr)
-        except ConnectionResetError:
-            pass
-        except asyncio.IncompleteReadError as e:
-            if e.partial:
-                raise
-
-    async def _dispatch_frames(self):
-        while True:
-            fr = await self.rbuf.frames.get()
-            await self._dispatch_single_frame(fr)
-
-    async def _dispatch_single_frame(self, frame: Union[Packet, Frame]):
-        if isinstance(frame, Frame):
-            await self.conn.handle_frame(frame)
-        elif isinstance(frame, Packet):
-            await self.conn.handle_packet(frame)
-        else:
-            raise RuntimeError('invalid frame ' + repr(frame))
-
-def parse_secret(s: bytes) -> Secret:
-    magic, ver = struct.unpack('II', s[:8])
-    if magic != SECRET_MAGIC:
-        raise ValueError('invalid secret magic: ' + repr(s))
-    if ver != 0:
-        raise ValueError('unsupported secret version: ' + repr(s))
-    s = s[8:]
-    model, s = s[:16], s[16:]
-    akey, s = s[:16], s[16:]
-    skey, s = s[:320], s[320:]
-    mac, s = s[:120], s[120:]
-    tinfo, s = s[:2000], s[2000:]
-    snum, s = s[:80], s[80:]
-    if s:
-        raise ValueError('garbage after secret: ' + repr(s))
-    def rdstr(v: bytes) -> str:
-        return v.rstrip(b'\0').decode('utf-8')
-    ret = Secret()
-    ret.model = rdstr(model)
-    ret.auth_key = akey
-    ret.session_key = list(map(bytes, zip(*[iter(skey)] * 16)))
-    ret.mac = list(map(bytes, zip(*[iter(mac)] * 6)))
-    ret.traid_info = list(map(rdstr, map(bytes, zip(*[iter(tinfo)] * 100))))
-    ret.static_num = list(struct.unpack('I' * 20, snum))
-    return ret
-
-async def main():
-    with open('auth_info.bin', 'rb') as fp:
-        secret = parse_secret(fp.read())
-        print(secret)
-
-    # with open('packets.raw') as fp:
-    #     for v in fp.read().splitlines():
-    #         v = bytes.fromhex(v)
-    #         print('magic: %#x, unk1: %#04x, ty: %#04x, seq: %3d, unk2: %#010x, size: %4d, unk3: %r' % struct.unpack('IBBHIH10s', v[:24]))
-
-    # with open('packets.raw') as fp:
-    #     for v in fp.read().splitlines():
-    #         v = bytes.fromhex(v)
-    #         hdr, sig, data = v[:16], v[16:32], v[32:]
-    #         magic, cmd, size, ver = struct.unpack('IIII', hdr)
-    #         print('magic: %#x, cmd: %s (%#x), size: %d, ver: %d, sig: %s' % (magic, PacketCmd(cmd), cmd, size, ver, sig.hex()))
-    #         if data:
-    #             print(' data: ')
-    #             hexdump.hexdump(secret.decrypt(0, data, size))
-
-    # with open('packets.raw') as fp:
-    #     dec = StreamSerdes(secret)
-    #     for p in dec.decode(b''.join([bytes.fromhex(v) for v in fp.read().splitlines()]), 0):
-    #         print(p.type)
-
-    await MiCameraStation(secret).serve_forever()
+            # check for connection
+            if addr not in self.conn:
+                self.log.warning('Unexpected UDP packet from %s:%d, dropped.', addr, port)
+            else:
+                self.conn[addr].handle_udp(data)
 
 if __name__ == '__main__':
     coloredlogs.install(fmt = LOG_FMT, level = LOG_LEVEL, milliseconds = True)
-    asyncio.run(main())
+    asyncio.run(MWC11(KeyStore.load()).serve_forever())

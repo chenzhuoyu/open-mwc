@@ -18,6 +18,12 @@ from enum import IntEnum
 from urllib import parse
 from logging import Logger
 
+from miot import Payload
+from miot import RPCError
+from miot import RPCRequest
+from miot import RPCResponse
+from miot import SignSuite
+
 from typing import Any
 from typing import Callable
 from typing import Optional
@@ -42,12 +48,6 @@ from cryptography.hazmat.primitives.asymmetric.ec import SECP384R1
 from cryptography.hazmat.primitives.asymmetric.ec import generate_private_key
 from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey
 
-from miot import Payload
-from miot import RPCError
-from miot import RPCRequest
-from miot import RPCResponse
-from miot import SignSuite
-
 LOG_FMT      = '%(asctime)s %(name)s [%(levelname)s] %(message)s'
 LOG_LEVEL    = logging.DEBUG
 
@@ -59,13 +59,6 @@ class Seq:
     def foreach(func: Callable[[bytes], None], seq: Sequence[bytes]):
         for v in seq:
             func(v)
-
-class Time:
-    _t0 = time.time()
-
-    @classmethod
-    def now(cls) -> int:
-        return int((time.time() - cls._t0) * 1000)
 
 class PinMode(IntEnum):
     Unknown1    = 1
@@ -141,6 +134,7 @@ class PacketType(IntEnum):
     Keepalive   = 3
 
 class Packet:
+    t0    : float = time.time()
     ts    : int
     did   : int
     data  : Optional[Payload]
@@ -238,12 +232,16 @@ class Packet:
         return cls(ts, did, RPCRequest.from_bytes(data), ty, cksum)
 
     @classmethod
+    def now(cls) -> int:
+        return int((time.time() - cls.t0) * 1000)
+
+    @classmethod
     def rpc(cls, did: int, data: Payload) -> 'Packet':
-        return cls(Time.now(), did, data, PacketType.RPC, b'')
+        return cls(cls.now(), did, data, PacketType.RPC, b'')
 
     @classmethod
     def probe_ack(cls, did: int, token: bytes) -> 'Packet':
-        return cls(Time.now(), did, None, PacketType.Probe, token)
+        return cls(cls.now(), did, None, PacketType.Probe, token)
 
 class CurveSuite(IntEnum):
     SECP256R1   = 3
@@ -427,14 +425,11 @@ class Handshake:
 
 class MACAddress:
     @staticmethod
-    def parse(mac: Any) -> bytes:
-        if not isinstance(mac, str):
-            raise TypeError('MAC address must be a string')
-        else:
-            return MACAddress.validate(binascii.unhexlify(mac.replace(':', '')))
+    def from_str(mac: str) -> bytes:
+        return MACAddress.validated(binascii.unhexlify(mac.replace(':', '')))
 
     @staticmethod
-    def validate(mac: bytes) -> bytes:
+    def validated(mac: bytes) -> bytes:
         if len(mac) != 6:
             raise ValueError('invalid mac address: ' + mac.hex(':'))
         else:
@@ -447,6 +442,8 @@ class RPCHandler:
 
     class Config(NamedTuple):
         uid      : int
+        ssid     : str
+        passwd   : str
         bind_key : str
 
     def __init__(self, pin: Pin, token: bytes):
@@ -496,10 +493,12 @@ class RPCHandler:
         buf = self.hs.key.decrypt(data)
         cfg = json.loads(buf.decode('utf-8'))
         uid = Payload.type_checked(cfg['uid'], int)
+        sid = Payload.type_checked(cfg['ssid'], str)
+        pwd = Payload.type_checked(cfg['passwd'], str)
         key = Payload.type_checked(cfg['bind_key'], str)
 
         # save the configuration
-        self.cfg = self.Config(uid, key)
+        self.cfg = self.Config(uid, sid, pwd, key)
         return ['ok']
 
     __rpc_handlers__ = {
@@ -508,7 +507,36 @@ class RPCHandler:
         'miIO.config_router_safe' : _rpc_miio_config_router_safe,
     }
 
-class Configuration:
+class ApConfiguration:
+    ssid   : str
+    passwd : str
+
+    def __init__(self, ssid: str, passwd: str):
+        self.ssid   = ssid
+        self.passwd = passwd
+
+    def __repr__(self) -> str:
+        return '\n'.join([
+            'ApConfiguration {',
+            '    ssid   = ' + self.ssid,
+            '    passwd = ' + self.passwd,
+            '}',
+        ])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'ssid'   : self.ssid,
+            'passwd' : self.passwd,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> 'ApConfiguration':
+        return cls(
+            ssid   = Payload.type_checked(data['ssid'], str),
+            passwd = Payload.type_checked(data['passwd'], str),
+        )
+
+class DeviceConfiguration:
     did      : int
     uid      : int
     mac      : bytes
@@ -519,14 +547,14 @@ class Configuration:
     def __init__(self, did: int, uid: int, mac: bytes, oob: bytes, token: bytes, bind_key: bytes):
         self.did      = did
         self.uid      = uid
-        self.mac      = MACAddress.validate(mac)
+        self.mac      = MACAddress.validated(mac)
         self.oob      = oob
         self.token    = token
         self.bind_key = bind_key
 
     def __repr__(self) -> str:
         return '\n'.join([
-            'Configuration {',
+            'DeviceConfiguration {',
             '    did      = %d' % self.did,
             '    uid      = %d' % self.uid,
             '    mac      = %s' % self.mac.hex(':'),
@@ -551,10 +579,39 @@ class Configuration:
         return cls(
             Payload.type_checked(data['did'], int),
             Payload.type_checked(data['uid'], int),
-            MACAddress.parse(data['mac']),
+            MACAddress.from_str(Payload.type_checked(data['mac'], str)),
             Payload.type_checked(data['oob'], str).encode('utf-8'),
             Payload.type_checked(data['token'], str).encode('utf-8'),
             Payload.type_checked(data['bind_key'], str).encode('utf-8'),
+        )
+
+class Configuration:
+    ap     : ApConfiguration
+    device : DeviceConfiguration
+
+    def __init__(self, ap: ApConfiguration, device: DeviceConfiguration):
+        self.ap     = ap
+        self.device = device
+
+    def __repr__(self) -> str:
+        return '\n'.join([
+            'Configuration {',
+            '    ap     = ' + '\n'.join(v + ' ' * 4 for v in str(self.ap).splitlines()),
+            '    device = ' + '\n'.join(v + ' ' * 4 for v in str(self.device).splitlines()),
+            '}',
+        ])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'ap'     : self.ap.to_dict(),
+            'device' : self.device.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(self, data: dict[str, Any]) -> 'Configuration':
+        return Configuration(
+            ap     = ApConfiguration.from_dict(Payload.type_checked(data['ap'], dict)),
+            device = DeviceConfiguration.from_dict(Payload.type_checked(data['device'], dict)),
         )
 
 class Discovery:
@@ -615,16 +672,22 @@ class Discovery:
 
         # construct the configuration
         return Configuration(
-            did      = self.did,
-            uid      = self.rpc.cfg.uid,
-            mac      = self.mac,
-            oob      = self.pin.oob,
-            token    = self.key.token,
-            bind_key = self.rpc.cfg.bind_key.encode('utf-8'),
+            ap = ApConfiguration(
+                ssid   = self.rpc.cfg.ssid,
+                passwd = self.rpc.cfg.passwd,
+            ),
+            device = DeviceConfiguration(
+                did      = self.did,
+                uid      = self.rpc.cfg.uid,
+                mac      = self.mac,
+                oob      = self.pin.oob,
+                token    = self.key.token,
+                bind_key = self.rpc.cfg.bind_key.encode('utf-8'),
+            ),
         )
 
     @classmethod
-    async def discover(cls, url: str) -> Configuration:
+    async def discover(cls, url: str, *, token: bytes = b'') -> Configuration:
         url = parse.urlparse(url)
         query = parse.parse_qs(url.query)
 
@@ -645,14 +708,20 @@ class Discovery:
         except (KeyError, ValueError):
             raise ValueError('not a valid device identification URL') from None
 
-        # generate a random token, and start discovery
-        token = base64.b64encode(os.urandom(12))
-        return await cls(did, MACAddress.parse(mac), Key.from_token(token), Pin.from_oob(oob)).run()
+        # generate a random token if needed
+        if not token:
+            token = base64.b64encode(os.urandom(12))
+
+        # start the discovery
+        pin = Pin.from_oob(oob)
+        key = Key.from_token(token)
+        mac = MACAddress.from_str(mac)
+        return await cls(did, mac, key, pin).run()
 
 async def main():
     p = argparse.ArgumentParser()
-    p.add_argument('-c', '--config', metavar = 'FILE', type = str, help = 'path to save the config file', default = 'miio.json')
-    p.add_argument('url', type = 'str', help = 'device identification URL')
+    p.add_argument('-c', '--config', metavar = 'FILE', type = str, help = 'path to save the config file', default = 'mwc10.json')
+    p.add_argument('url', type = str, help = 'device identification URL')
 
     # start the discovery
     ns = p.parse_args()
@@ -662,14 +731,14 @@ async def main():
     try:
         with open(ns.config) as fp:
             data = Payload.type_checked(json.load(fp), dict)
-    except (TypeError, FileNotFoundError):
+    except (TypeError, ValueError, FileNotFoundError):
         data = {}
     finally:
-        data['device'] = cfg.to_dict()
+        data.update(**cfg.to_dict())
 
     # save the configuration to file
     with open(ns.config, 'w') as fp:
-        json.dump(data, fp, indent = 4)
+        json.dump(data, fp, indent = 4, sort_keys = True)
         logging.getLogger('disco').info('Configuration was saved to "%s".', ns.config)
 
 if __name__ == '__main__':
