@@ -17,6 +17,12 @@ impl MACAddress {
     }
 }
 
+impl MACAddress {
+    pub fn bytes(&self) -> [u8; 6] {
+        self.buf
+    }
+}
+
 impl Debug for MACAddress {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("MACAddress")

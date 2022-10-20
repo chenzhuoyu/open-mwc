@@ -1,3 +1,4 @@
+#![feature(duration_constants)]
 #![feature(let_chains)]
 
 use std::{
@@ -14,7 +15,7 @@ use mwc11proxy::{
     as_err,
     log::ConsoleLogger,
     options::Options,
-    Maybe, Unit,
+    tcp_accept, Maybe, Unit,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -37,10 +38,11 @@ const UDP_RECV_PORT: u16 = 32380;
 #[repr(u8)]
 #[derive(Debug)]
 enum PacketType {
-    UdpData = 0,
-    ComData = 1,
-    DspComm = 2,
-    UdpComm = 3,
+    StaInit = 0,
+    UdpData = 1,
+    ComData = 2,
+    DspComm = 3,
+    UdpComm = 4,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -48,10 +50,11 @@ impl TryFrom<u8> for PacketType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Self::UdpData),
-            1 => Ok(Self::ComData),
-            2 => Ok(Self::DspComm),
-            3 => Ok(Self::UdpComm),
+            0 => Ok(Self::StaInit),
+            1 => Ok(Self::UdpData),
+            2 => Ok(Self::ComData),
+            3 => Ok(Self::DspComm),
+            4 => Ok(Self::UdpComm),
             _ => Err(IoError::from(ErrorKind::InvalidInput)),
         }
     }
@@ -96,15 +99,20 @@ impl Dispatcher {
         dsp_comm: Option<OwnedWriteHalf>,
         udp_comm: Option<OwnedWriteHalf>,
     ) -> Maybe<Arc<Connection>> {
-        let cc = TcpStream::connect(sta).await?;
-        let (tx, udp_rx) = unbounded_channel();
+        let mut cc = TcpStream::connect(sta).await?;
+        let (udp_tx, udp_rx) = unbounded_channel();
+
+        /* send the inital packet */
+        cc.write_u8(PacketType::StaInit as u8).await?;
+        cc.write_u32(mac.bytes().len() as u32).await?;
+        cc.write_all(&mac.bytes()).await?;
 
         /* construct the connection */
         let conn = Arc::new(Connection {
             com_send: Mutex::new(com_send),
             dsp_comm: Mutex::new(dsp_comm),
             udp_comm: Mutex::new(udp_comm),
-            udp_send: tx,
+            udp_send: udp_tx,
         });
 
         /* split the reader and writer */
@@ -114,7 +122,7 @@ impl Dispatcher {
         let (com_rx, com_tx) = com_recv.into_split();
 
         /* create a dispatcher instance */
-        let disp = Dispatcher {
+        let dis = Dispatcher {
             buf,
             mac,
             conn,
@@ -127,7 +135,7 @@ impl Dispatcher {
         };
 
         /* start the connection */
-        tokio::spawn(disp.event_loop());
+        tokio::spawn(dis.run());
         Ok(ret)
     }
 }
@@ -147,32 +155,32 @@ impl Dispatcher {
 }
 
 impl Dispatcher {
-    async fn event_loop(mut self) {
+    async fn run(mut self) {
+        self.event_loop().await;
+        self.com_tx.shutdown().await.unwrap_or_default();
+        self.notify.send((self.mac, ServerEvent::Dropped)).unwrap();
+    }
+
+    async fn event_loop(&mut self) {
         loop {
             match self.handle_events().await {
                 Ok(None) => break,
                 Ok(Some(_)) => continue,
                 Err(err) => {
-                    log::error!("Connection error from {}: {}", self.mac, err);
+                    log::error!("Connection error from {}: {}", &self.mac, err);
                     break;
                 }
             }
         }
-
-        /* shutdown the connection */
-        self.com_tx.shutdown().await.unwrap_or_default();
-        self.notify.send((self.mac, ServerEvent::Dropped)).unwrap();
     }
-}
 
-impl Dispatcher {
     async fn handle_events(&mut self) -> Maybe<Option<()>> {
         tokio::select! {
             ret = self.udp_rx.recv() => {
                 if let Some(buf) = ret {
                     self.handle_udp_data(buf).await.map(Some)
                 } else {
-                    log::info!("UDP_DATA for {} was closed.", self.mac);
+                    log::info!("UDP_DATA for {} was closed.", &self.mac);
                     Ok(None)
                 }
             }
@@ -180,7 +188,7 @@ impl Dispatcher {
                 if let Some(buf) = ret? {
                     self.handle_com_data(buf).await.map(Some)
                 } else {
-                    log::info!("COM_RECV for {} was closed.", self.mac);
+                    log::info!("COM_RECV for {} was closed.", &self.mac);
                     Ok(None)
                 }
             }
@@ -189,7 +197,7 @@ impl Dispatcher {
                     self.buf.extend_from_slice(&buf);
                     self.handle_tcp_recv().await.map(Some)
                 } else {
-                    log::info!("Station link for {} was closed.", self.mac);
+                    log::info!("Station link for {} was closed.", &self.mac);
                     Ok(None)
                 }
             }
@@ -221,16 +229,21 @@ impl Dispatcher {
 
             /* check for packet type */
             match tag {
+                PacketType::StaInit => log::warn!("Unexpected STA_INIT packet, dropped."),
                 PacketType::UdpData => log::warn!("Unexpected UDP_DATA packet, dropped."),
                 PacketType::ComData => self.conn.com_send.lock().await.write_all(&buf).await?,
                 PacketType::DspComm => {
                     if let Some(conn) = self.conn.dsp_comm.lock().await.as_mut() {
                         conn.write_all(&buf).await?;
+                    } else {
+                        log::warn!("DSP_COMM for {} is not ready, dropped.", &self.mac);
                     }
                 }
                 PacketType::UdpComm => {
                     if let Some(conn) = self.conn.udp_comm.lock().await.as_mut() {
                         conn.write_all(&buf).await?;
+                    } else {
+                        log::warn!("UDP_COMM for {} is not ready, dropped.", &self.mac);
                     }
                 }
             }
@@ -400,7 +413,7 @@ impl Aggregator {
         send: UnboundedSender<(MACAddress, ServerEvent)>,
     ) -> Unit {
         loop {
-            let (conn, addr) = srv.accept().await?;
+            let (conn, addr) = tcp_accept(&srv).await?;
             let addr = addr.ip();
 
             /* must be an IPv4 connection */
@@ -417,7 +430,7 @@ impl Aggregator {
         send: UnboundedSender<(MACAddress, ServerEvent)>,
     ) -> Unit {
         loop {
-            let (conn, addr) = srv.accept().await?;
+            let (conn, addr) = tcp_accept(&srv).await?;
             let addr = addr.ip();
 
             /* must be an IPv4 connection */
@@ -435,7 +448,7 @@ impl Aggregator {
         send: UnboundedSender<(MACAddress, ServerEvent)>,
     ) -> Unit {
         loop {
-            let (conn, addr) = srv.accept().await?;
+            let (conn, addr) = tcp_accept(&srv).await?;
             let addr = addr.ip();
 
             /* must be an IPv4 connection */
@@ -453,7 +466,7 @@ impl Aggregator {
         send: UnboundedSender<(MACAddress, ServerEvent)>,
     ) -> Unit {
         loop {
-            let (conn, addr) = srv.accept().await?;
+            let (conn, addr) = tcp_accept(&srv).await?;
             let addr = addr.ip();
 
             /* must be an IPv4 connection */
@@ -492,10 +505,16 @@ impl Aggregator {
     ) -> Unit {
         match event {
             ServerEvent::Dropped => {
-                self.conn.remove(&mac);
-                self.pend.remove(&mac);
-                log::info!("Connection {} closed.", mac);
-                Ok(())
+                if let Some(_) = self.pend.remove(&mac) {
+                    log::info!("Connection {} was aborted.", mac);
+                    Ok(())
+                } else if let Some(_) = self.conn.remove(&mac) {
+                    log::info!("Connection {} was closed.", mac);
+                    Ok(())
+                } else {
+                    log::warn!("Dropping non-existing connection from {}.", mac);
+                    Ok(())
+                }
             }
             ServerEvent::UdpRecv(buf) => {
                 if let Some(conn) = self.conn.get(&mac) {
