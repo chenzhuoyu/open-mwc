@@ -41,7 +41,7 @@ impl Display for MACAddress {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 mod detail {
     use std::{
         alloc::Layout,
@@ -49,46 +49,83 @@ mod detail {
         ptr::null_mut,
     };
 
-    use libc::{
-        __error, sockaddr_dl, sockaddr_inarp, sysctl, AF_INET, CTL_NET, NET_RT_FLAGS, PF_ROUTE,
-        RTF_LLINFO,
-    };
+    use libc::{sockaddr_dl, sockaddr_in, sysctl, AF_INET, CTL_NET, NET_RT_FLAGS, PF_ROUTE};
 
     use super::MACAddress;
 
-    #[repr(C)]
-    #[derive(Debug, Clone, Copy, Default)]
-    struct rt_msghdr {
-        pub rtm_msglen: libc::c_ushort, // to skip over non-understood messages
-        pub rtm_version: libc::c_uchar, // future binary compatibility
-        pub rtm_type: libc::c_uchar,    // message type
-        pub rtm_index: libc::c_ushort,  // index for associated ifp
-        pub rtm_flags: libc::c_int,     // flags, incl. kern & message, e.g. DONE
-        pub rtm_addrs: libc::c_int,     // bitmask identifying sockaddrs in msg
-        pub rtm_pid: libc::pid_t,       // identify sender
-        pub rtm_seq: libc::c_int,       // for sender to identify action
-        pub rtm_errno: libc::c_int,     // why failed
-        pub rtm_use: libc::c_int,       // from rtentry
-        pub rtm_inits: u32,             // which metrics we are initializing
-        pub rtm_rmx: rt_metrics,        // metrics themselves
+    #[cfg(target_os = "macos")]
+    mod rtm {
+        #[repr(C)]
+        pub(super) struct rt_msghdr {
+            pub rtm_msglen: libc::c_ushort,
+            pub rtm_version: libc::c_uchar,
+            pub rtm_type: libc::c_uchar,
+            pub rtm_index: libc::c_ushort,
+            pub rtm_flags: libc::c_int,
+            pub rtm_addrs: libc::c_int,
+            pub rtm_pid: libc::pid_t,
+            pub rtm_seq: libc::c_int,
+            pub rtm_errno: libc::c_int,
+            pub rtm_use: libc::c_int,
+            pub rtm_inits: u32,
+            pub rtm_rmx: rt_metrics,
+        }
+
+        #[repr(C)]
+        pub(super) struct rt_metrics {
+            pub rmx_locks: u32,
+            pub rmx_mtu: u32,
+            pub rmx_hopcount: u32,
+            pub rmx_expire: i32,
+            pub rmx_recvpipe: u32,
+            pub rmx_sendpipe: u32,
+            pub rmx_ssthresh: u32,
+            pub rmx_rtt: u32,
+            pub rmx_rttvar: u32,
+            pub rmx_pksent: u32,
+            pub rmx_state: u32,
+            pub rmx_filler: [u32; 3],
+        }
     }
 
-    #[repr(C)]
-    #[derive(Debug, Clone, Copy, Default)]
-    struct rt_metrics {
-        pub rmx_locks: u32,       // Kernel leaves these values alone
-        pub rmx_mtu: u32,         // MTU for this path
-        pub rmx_hopcount: u32,    // max hops expected
-        pub rmx_expire: i32,      // lifetime for route, e.g. redirect
-        pub rmx_recvpipe: u32,    // inbound delay-bandwidth product
-        pub rmx_sendpipe: u32,    // outbound delay-bandwidth product
-        pub rmx_ssthresh: u32,    // outbound gateway buffer limit
-        pub rmx_rtt: u32,         // estimated round trip time
-        pub rmx_rttvar: u32,      // estimated rtt variance
-        pub rmx_pksent: u32,      // packets sent using this route
-        pub rmx_state: u32,       // route state
-        pub rmx_filler: [u32; 3], // will be used for T/TCP later
+    #[cfg(target_os = "freebsd")]
+    mod rtm {
+        #[repr(C)]
+        pub(super) struct rt_msghdr {
+            pub rtm_msglen: libc::c_ushort,
+            pub rtm_version: libc::c_uchar,
+            pub rtm_type: libc::c_uchar,
+            pub rtm_index: libc::c_ushort,
+            pub rtm_flags: libc::c_int,
+            pub rtm_addrs: libc::c_int,
+            pub rtm_pid: libc::pid_t,
+            pub rtm_seq: libc::c_int,
+            pub rtm_errno: libc::c_int,
+            pub rtm_use: libc::c_int,
+            pub rtm_inits: libc::c_ulong,
+            pub rtm_rmx: rt_metrics,
+        }
+
+        #[repr(C)]
+        pub(super) struct rt_metrics {
+            pub rmx_locks: libc::c_ulong,
+            pub rmx_mtu: libc::c_ulong,
+            pub rmx_hopcount: libc::c_ulong,
+            pub rmx_expire: libc::c_ulong,
+            pub rmx_recvpipe: libc::c_ulong,
+            pub rmx_sendpipe: libc::c_ulong,
+            pub rmx_ssthresh: libc::c_ulong,
+            pub rmx_rtt: libc::c_ulong,
+            pub rmx_rttvar: libc::c_ulong,
+            pub rmx_pksent: libc::c_ulong,
+            pub rmx_weight: libc::c_ulong,
+            pub rmx_nhidx: libc::c_ulong,
+            pub rmx_filler: [libc::c_ulong; 2],
+        }
     }
+
+    const RTM_SIZE: usize = std::mem::size_of::<rtm::rt_msghdr>();
+    const RTF_LLINFO: i32 = 0x400;
 
     pub(super) unsafe fn lookup_impl(addr: u32) -> IoResult<Option<MACAddress>> {
         let mut len = 0;
@@ -106,7 +143,12 @@ mod detail {
 
         /* check for errors */
         if ret < 0 {
-            return Err(IoError::from_raw_os_error(*__error()));
+            return Err(IoError::from_raw_os_error(ret));
+        }
+
+        /* empty table */
+        if len == 0 {
+            return Ok(None);
         }
 
         /* allocate raw memory */
@@ -139,9 +181,9 @@ mod detail {
 
         /* find the address in question */
         while i < len {
-            let rtm = buf.add(i) as *const rt_msghdr;
-            let sin = rtm.add(1) as *const sockaddr_inarp;
-            let sdl = sin.add(1) as *const sockaddr_dl;
+            let rtm = buf.byte_add(i) as *const rtm::rt_msghdr;
+            let sin = rtm.byte_add(RTM_SIZE) as *const sockaddr_in;
+            let sdl = sin.byte_add((&*sin).sin_len as usize) as *const sockaddr_dl;
 
             /* check if the address is complete and matches the requested address */
             if (&*sdl).sdl_alen == 0 || (&*sin).sin_addr.s_addr != addr {
@@ -172,7 +214,112 @@ mod detail {
 
 #[cfg(target_os = "linux")]
 mod detail {
-    pub(super) unsafe fn lookup_impl(addr: u32) -> IoResult<Option<MACAddress>> {}
+    use std::io::{Error as IoError, Result as IoResult};
+
+    use libc::{
+        __errno_location, arpreq, close, freeifaddrs, getifaddrs, ifaddrs, ioctl, sockaddr_in,
+        socket, strncpy, AF_INET, ATF_COM, ENXIO, IFF_POINTOPOINT, IFNAMSIZ, SIOCGARP, SOCK_DGRAM,
+    };
+
+    use super::MACAddress;
+
+    pub(super) unsafe fn lookup_impl(addr: u32) -> IoResult<Option<MACAddress>> {
+        let mut req = std::mem::zeroed::<arpreq>();
+        let mut ifa = std::ptr::null_mut::<ifaddrs>();
+
+        /* get all the interface addresses */
+        if getifaddrs(&mut ifa as *mut *mut _) == -1 {
+            return Err(IoError::from_raw_os_error(*__errno_location()));
+        }
+
+        /* create a new socket for querying ARP entries */
+        let ifp = ifa;
+        let sfd = socket(AF_INET, SOCK_DGRAM, 0);
+        let sin = &mut *(&mut req.arp_pa as *mut _ as *mut sockaddr_in);
+
+        /* check the socket */
+        if sfd < 0 {
+            return Err(IoError::from_raw_os_error(*__errno_location()));
+        }
+
+        /* iterate over the interface addresses */
+        while !ifa.is_null() {
+            let faddr = (*ifa).ifa_addr;
+            let flags = (*ifa).ifa_flags;
+
+            /* must have an address */
+            if faddr.is_null() {
+                ifa = (*ifa).ifa_next;
+                continue;
+            }
+
+            /* must be an AF_INET address */
+            if (*faddr).sa_family != AF_INET as u16 {
+                ifa = (*ifa).ifa_next;
+                continue;
+            }
+
+            /* ... which must not be a P2P address */
+            if flags & IFF_POINTOPOINT as u32 != 0 {
+                ifa = (*ifa).ifa_next;
+                continue;
+            }
+
+            /* get the interface address and net mask */
+            let iaddr = (*(faddr as *const sockaddr_in)).sin_addr.s_addr as u32;
+            let nmask = (*((*ifa).ifa_netmask as *const sockaddr_in))
+                .sin_addr
+                .s_addr as u32;
+
+            /* match the addresses */
+            if addr & nmask != iaddr & nmask {
+                ifa = (*ifa).ifa_next;
+                continue;
+            }
+
+            /* fill the address */
+            sin.sin_family = AF_INET as u16;
+            sin.sin_addr.s_addr = addr;
+            strncpy(&mut req.arp_dev as *mut _, (*ifa).ifa_name, IFNAMSIZ);
+
+            /* lookup the ARP table */
+            if ioctl(sfd, SIOCGARP, &mut req as *mut _) < 0 {
+                if *__errno_location() == ENXIO {
+                    ifa = (*ifa).ifa_next;
+                    continue;
+                } else {
+                    close(sfd);
+                    freeifaddrs(ifp as *mut _);
+                    return Err(IoError::from_raw_os_error(*__errno_location()));
+                }
+            }
+
+            /* check for completeness */
+            if req.arp_flags & ATF_COM == 0 {
+                ifa = (*ifa).ifa_next;
+                continue;
+            }
+
+            /* close the socket */
+            close(sfd);
+            freeifaddrs(ifp as *mut _);
+
+            /* build the MAC address */
+            return Ok(Some(MACAddress::new([
+                req.arp_ha.sa_data[0] as u8,
+                req.arp_ha.sa_data[1] as u8,
+                req.arp_ha.sa_data[2] as u8,
+                req.arp_ha.sa_data[3] as u8,
+                req.arp_ha.sa_data[4] as u8,
+                req.arp_ha.sa_data[5] as u8,
+            ])));
+        }
+
+        /* found nothing */
+        close(sfd);
+        freeifaddrs(ifp as *mut _);
+        return Ok(None);
+    }
 }
 
 pub fn lookup(addr: &Ipv4Addr) -> Maybe<MACAddress> {
@@ -191,7 +338,7 @@ mod test {
 
     #[test]
     fn test_resolve() -> Unit {
-        let ret = lookup(&Ipv4Addr::from_str(&"172.20.0.135")?)?;
+        let ret = lookup(&Ipv4Addr::from_str(&"172.20.0.158")?)?;
         dbg!(ret);
         Ok(())
     }
