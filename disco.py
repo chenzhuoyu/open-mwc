@@ -39,14 +39,19 @@ from cryptography.hazmat.primitives.ciphers import Cipher
 from cryptography.hazmat.primitives.ciphers.modes import CBC
 from cryptography.hazmat.primitives.ciphers.algorithms import AES128
 
-from cryptography.hazmat.primitives._serialization import Encoding
-from cryptography.hazmat.primitives._serialization import PublicFormat
-
 from cryptography.hazmat.primitives.asymmetric.ec import ECDH
 from cryptography.hazmat.primitives.asymmetric.ec import SECP256R1
 from cryptography.hazmat.primitives.asymmetric.ec import SECP384R1
 from cryptography.hazmat.primitives.asymmetric.ec import generate_private_key
 from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey
+
+from cryptography.hazmat.primitives._serialization import Encoding
+from cryptography.hazmat.primitives._serialization import PublicFormat
+
+from mwc1x import MACAddress
+from mwc1x import Configuration
+from mwc1x import ApConfiguration
+from mwc1x import DeviceConfiguration
 
 LOG_FMT      = '%(asctime)s %(name)s [%(levelname)s] %(message)s'
 LOG_LEVEL    = logging.DEBUG
@@ -299,7 +304,7 @@ class Handshake:
     def _stage_2(self, p: RPCRequest) -> dict[str, Any]:
         algo = SignSuite(Payload.type_checked(p.args['ecdh']['sign_suite'], int))
         curve = CurveSuite(Payload.type_checked(p.args['ecdh']['curve_suite'], int))
-        pubkey = base64.b64decode(Payload.type_checked(p.args['ecdh']['public_key'], str).encode('utf-8'))
+        pubkey = base64.b64decode(Payload.type_checked(p.args['ecdh']['public_key'], str))
 
         # check for stage
         if not self._advance(2, 31):
@@ -364,13 +369,11 @@ class Handshake:
         sign = p.args['oob']['sign']
         sign = Payload.type_checked(sign, str)
 
-        # check for stage
+        # check for stage, and decode the sign bytes
         if not self._advance(32, 33):
             raise RPCError(RPCError.Code.InvalidParameters, 'unexpected handshake stage 3 step 2')
-
-        # decode the sign bytes
-        sign = sign.encode('utf-8')
-        self.sign = base64.b64decode(sign)
+        else:
+            self.sign = base64.b64decode(sign)
 
         # compose the response
         return {
@@ -390,7 +393,7 @@ class Handshake:
             raise RPCError(RPCError.Code.InvalidParameters, 'unexpected handshake stage 3 step 3')
 
         # verify the signature
-        if not self.key.verify(self.sign, base64.b64decode(rand.encode('utf-8')), self.pin.oob):
+        if not self.key.verify(self.sign, base64.b64decode(rand), self.pin.oob):
             raise RPCError(RPCError.Code.InvalidParameters, 'signature mismatch in handshake stage 3 step 3')
 
         # generate a random IV
@@ -422,18 +425,6 @@ class Handshake:
         except Exception:
             self.stage = 1
             raise
-
-class MACAddress:
-    @staticmethod
-    def from_str(mac: str) -> bytes:
-        return MACAddress.validated(binascii.unhexlify(mac.replace(':', '')))
-
-    @staticmethod
-    def validated(mac: bytes) -> bytes:
-        if len(mac) != 6:
-            raise ValueError('invalid mac address: ' + mac.hex(':'))
-        else:
-            return mac
 
 class RPCHandler:
     hs  : Handshake
@@ -482,8 +473,8 @@ class RPCHandler:
         return self.hs.handle(p)
 
     async def _rpc_miio_config_router_safe(self, p: RPCRequest) -> list[str]:
-        data = base64.b64decode(Payload.type_checked(p.args['data'], str).encode('utf-8'))
-        sign = base64.b64decode(Payload.type_checked(p.args['sign'], str).encode('utf-8'))
+        data = base64.b64decode(Payload.type_checked(p.args['data'], str))
+        sign = base64.b64decode(Payload.type_checked(p.args['sign'], str))
 
         # check for signature
         if not self.hs.ok or not self.hs.key.verify(sign, data):
@@ -506,113 +497,6 @@ class RPCHandler:
         'miIO.stop_diag_mode'     : _rpc_nop,
         'miIO.config_router_safe' : _rpc_miio_config_router_safe,
     }
-
-class ApConfiguration:
-    ssid   : str
-    passwd : str
-
-    def __init__(self, ssid: str, passwd: str):
-        self.ssid   = ssid
-        self.passwd = passwd
-
-    def __repr__(self) -> str:
-        return '\n'.join([
-            'ApConfiguration {',
-            '    ssid   = ' + self.ssid,
-            '    passwd = ' + self.passwd,
-            '}',
-        ])
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            'ssid'   : self.ssid,
-            'passwd' : self.passwd,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> 'ApConfiguration':
-        return cls(
-            ssid   = Payload.type_checked(data['ssid'], str),
-            passwd = Payload.type_checked(data['passwd'], str),
-        )
-
-class DeviceConfiguration:
-    did      : int
-    uid      : int
-    mac      : bytes
-    oob      : bytes
-    token    : bytes
-    bind_key : bytes
-
-    def __init__(self, did: int, uid: int, mac: bytes, oob: bytes, token: bytes, bind_key: bytes):
-        self.did      = did
-        self.uid      = uid
-        self.mac      = MACAddress.validated(mac)
-        self.oob      = oob
-        self.token    = token
-        self.bind_key = bind_key
-
-    def __repr__(self) -> str:
-        return '\n'.join([
-            'DeviceConfiguration {',
-            '    did      = %d' % self.did,
-            '    uid      = %d' % self.uid,
-            '    mac      = %s' % self.mac.hex(':'),
-            '    oob      = %s' % self.oob.decode('utf-8'),
-            '    token    = %s' % self.token.decode('utf-8'),
-            '    bind_key = %s' % self.bind_key.decode('utf-8'),
-            '}',
-        ])
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            'did'      : self.did,
-            'uid'      : self.uid,
-            'mac'      : self.mac.hex(':'),
-            'oob'      : self.oob.decode('utf-8'),
-            'token'    : self.token.decode('utf-8'),
-            'bind_key' : self.bind_key.decode('utf-8'),
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]):
-        return cls(
-            Payload.type_checked(data['did'], int),
-            Payload.type_checked(data['uid'], int),
-            MACAddress.from_str(Payload.type_checked(data['mac'], str)),
-            Payload.type_checked(data['oob'], str).encode('utf-8'),
-            Payload.type_checked(data['token'], str).encode('utf-8'),
-            Payload.type_checked(data['bind_key'], str).encode('utf-8'),
-        )
-
-class Configuration:
-    ap     : ApConfiguration
-    device : DeviceConfiguration
-
-    def __init__(self, ap: ApConfiguration, device: DeviceConfiguration):
-        self.ap     = ap
-        self.device = device
-
-    def __repr__(self) -> str:
-        return '\n'.join([
-            'Configuration {',
-            '    ap     = ' + '\n'.join(v + ' ' * 4 for v in str(self.ap).splitlines()),
-            '    device = ' + '\n'.join(v + ' ' * 4 for v in str(self.device).splitlines()),
-            '}',
-        ])
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            'ap'     : self.ap.to_dict(),
-            'device' : self.device.to_dict(),
-        }
-
-    @classmethod
-    def from_dict(self, data: dict[str, Any]) -> 'Configuration':
-        return Configuration(
-            ap     = ApConfiguration.from_dict(Payload.type_checked(data['ap'], dict)),
-            device = DeviceConfiguration.from_dict(Payload.type_checked(data['device'], dict)),
-        )
 
 class Discovery:
     did: int
@@ -715,30 +599,28 @@ class Discovery:
         # start the discovery
         pin = Pin.from_oob(oob)
         key = Key.from_token(token)
-        mac = MACAddress.from_str(mac)
+        mac = MACAddress.parse(mac)
         return await cls(did, mac, key, pin).run()
 
 async def main():
     p = argparse.ArgumentParser()
-    p.add_argument('-c', '--config', metavar = 'FILE', type = str, help = 'path to save the config file', default = 'mwc10.json')
+    p.add_argument('-c', '--config', metavar = 'FILE', type = str, help = 'path to save the config file', default = 'mwc1x.json')
     p.add_argument('url', type = str, help = 'device identification URL')
 
     # start the discovery
     ns = p.parse_args()
     cfg = await Discovery.discover(ns.url)
 
-    # load and update the current config
-    try:
-        with open(ns.config) as fp:
-            data = Payload.type_checked(json.load(fp), dict)
-    except (TypeError, ValueError, FileNotFoundError):
-        data = {}
-    finally:
-        data.update(**cfg.to_dict())
+    # dump the configuration before saving to avoid destroying the old config
+    data = json.dumps(
+        obj       = cfg.to_dict(),
+        indent    = 4,
+        sort_keys = True,
+    )
 
     # save the configuration to file
     with open(ns.config, 'w') as fp:
-        json.dump(data, fp, indent = 4, sort_keys = True)
+        fp.write(data)
         logging.getLogger('disco').info('Configuration was saved to "%s".', ns.config)
 
 if __name__ == '__main__':

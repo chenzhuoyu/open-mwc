@@ -86,8 +86,8 @@ class RPCError(Exception):
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> 'RPCError':
-        code = cls.type_checked(data['code'], int)
-        message = cls.type_checked(data['message'], str)
+        code = Payload.type_checked(data['code'], int)
+        message = Payload.type_checked(data['message'], str)
         return cls(code, message, data = data.get('data'))
 
 class RPCRequest(Payload):
@@ -133,9 +133,9 @@ class RPCRequest(Payload):
     @classmethod
     def from_json(cls, data: str) -> 'RPCRequest':
         obj = json.loads(data)
-        rid = cls.type_checked(obj.get('id', None), (int, None))
-        args = cls.type_checked(obj.get('params', {}), (str, list, dict))
-        method = cls.type_checked(obj['method'], str)
+        rid = Payload.type_checked(obj.get('id', None), (int, None))
+        args = Payload.type_checked(obj.get('params', {}), (str, list, dict))
+        method = Payload.type_checked(obj['method'], str)
 
         # handle the special case of an empty string
         if not isinstance(args, str):
@@ -200,8 +200,8 @@ class RPCResponse(Payload):
     @classmethod
     def from_json(cls, data: str) -> 'RPCRequest':
         obj = json.loads(data)
-        rid = cls.type_checked(obj['id'], int)
-        error = cls.type_checked(obj.get('error', {}), dict)
+        rid = Payload.type_checked(obj['id'], int)
+        error = Payload.type_checked(obj.get('error', {}), dict)
         return cls(rid, data = obj.get('result'), error = error and RPCError.from_dict(error) or None)
 
     @classmethod
@@ -307,11 +307,11 @@ class LoginRequest(Payload):
     @classmethod
     def from_json(cls, data: str) -> 'LoginRequest':
         obj = json.loads(data)
-        did = cls.type_checked(obj['did'], int)
-        cert = cls.type_checked(obj.get('cert', ''), str)
-        rand = cls.type_checked(obj.get('device_random', ''), str)
-        sign = base64.b64decode(cls.type_checked(obj.get('sign', ''), str))
-        algo = [SignSuite(cls.type_checked(v, int)) for v in cls.type_checked(obj.get('sign_suites', []), list)]
+        did = Payload.type_checked(obj['did'], int)
+        cert = Payload.type_checked(obj.get('cert', ''), str)
+        rand = Payload.type_checked(obj.get('device_random', ''), str)
+        sign = base64.b64decode(Payload.type_checked(obj.get('sign', ''), str))
+        algo = [SignSuite(Payload.type_checked(v, int)) for v in Payload.type_checked(obj.get('sign_suites', []), list)]
         return cls(did, cert = cert, sign = sign, rand = rand, algo = algo)
 
     @classmethod
@@ -367,10 +367,10 @@ class LoginResponse(Payload):
     @classmethod
     def from_json(cls, data: str) -> 'LoginResponse':
         obj = json.loads(data)
-        msg = cls.type_checked(obj.get('message', ''), str)
-        rand = cls.type_checked(obj.get('cloud_random', ''), str)
-        algo = SignSuite(cls.type_checked(obj.get('sign_suite', SignSuite.Invalid), int))
-        code = LoginStatus(cls.type_checked(obj.get('code', LoginStatus.NoCode), int))
+        msg = Payload.type_checked(obj.get('message', ''), str)
+        rand = Payload.type_checked(obj.get('cloud_random', ''), str)
+        algo = SignSuite(Payload.type_checked(obj.get('sign_suite', SignSuite.Invalid), int))
+        code = LoginStatus(Payload.type_checked(obj.get('code', LoginStatus.NoCode), int))
         return cls(code, msg, algo, rand)
 
     @classmethod
@@ -443,22 +443,12 @@ class Packet:
         return Packet(PacketType.Login, seq, LoginRequest(did, cert, rand, sign, algo))
 
     @classmethod
-    def notify(cls, seq: int, method: str, *args, **kwargs) -> 'Packet':
-        if args and kwargs:
-            raise ValueError('args and kwargs cannot be present at the same time')
-        else:
-            return Packet(PacketType.RPC, seq, RPCRequest(method, args = args or kwargs))
+    def request(cls, seq: int, req: RPCRequest) -> 'Packet':
+        return Packet(PacketType.RPC, seq, req)
 
     @classmethod
-    def request(cls, seq: int, id: int, method: str, *args, **kwargs) -> 'Packet':
-        if args and kwargs:
-            raise ValueError('args and kwargs cannot be present at the same time')
-        else:
-            return Packet(PacketType.RPC, seq, RPCRequest(method, id = id, args = args or kwargs))
-
-    @classmethod
-    def response(cls, seq: int, id: int, *, data: Optional[Any] = None, error: Optional[RPCError] = None) -> 'Packet':
-        return Packet(PacketType.RPCAck, seq, RPCResponse(id, data = data, error = error))
+    def response(cls, seq: int, resp: RPCResponse) -> 'Packet':
+        return Packet(PacketType.RPCAck, seq, resp)
 
     @classmethod
     def keepalive(cls, seq: int) -> 'Packet':
@@ -616,34 +606,57 @@ class MiotRPC:
         self.waiter = {}
         self.sender = sender
 
-    def _rand(self) -> int:
-        ret, = struct.unpack('H', os.urandom(2))
-        return ret
-
     def _next_id(self) -> int:
-        self.incr += 1
-        return (self.incr & 0xffff) | (self._rand() & 0x7fff) << 16
+        while True:
+            rng = struct.unpack('H', os.urandom(2))[0]
+            rid = (self.incr & 0xffff) | ((rng & 0x7fff) << 16)
+
+            # avoid ID confliction
+            if rid not in self.waiter:
+                self.incr += 1
+                return rid
 
     def _fire_timeout(self, pid: int):
         fut = self.waiter.pop(pid, None)
         fut and fut[0].set_exception(TimeoutError)
 
-    def send(self, method: str, *args, **kwargs) -> Future[RPCResponse]:
+    def _send_request(self, req: RPCRequest) -> Future[RPCResponse]:
         snd = self.sender()
-        pid = self._next_id()
         fut = asyncio.get_running_loop().create_future()
-        tmr = asyncio.get_running_loop().call_later(REQUEST_TIMEOUT, self._fire_timeout, pid)
-        snd.send_packet(Packet.request(snd.next_seq(), pid, method, *args, **kwargs))
-        self.waiter[pid] = (fut, tmr)
+        tmr = asyncio.get_running_loop().call_later(REQUEST_TIMEOUT, self._fire_timeout, req.id)
+        snd.send_packet(Packet.request(snd.next_seq(), req))
+        self.waiter[req.id] = (fut, tmr)
         return fut
 
+    @staticmethod
+    def _update_request_id(fut: Future[RPCResponse], rid: int):
+        if fut.done() and not fut.cancelled() and fut.exception() is None:
+            fut.result().id = rid
+
+    def send(self, method: str, *args, **kwargs) -> Future[RPCResponse]:
+        if args and kwargs:
+            raise ValueError('args and kwargs cannot be present at the same time')
+        else:
+            return self._send_request(RPCRequest(method, id = self._next_id(), args = args or kwargs))
+
+    def proxy(self, req: RPCRequest) -> Future[RPCResponse]:
+        if req.id not in self.waiter:
+            return self._send_request(req)
+        else:
+            ret = self._send_request(RPCRequest(req.method, id = self._next_id(), args = req.args))
+            ret.add_done_callback(lambda f: self._update_request_id(f, req.id))
+            return ret
+
     def notify(self, method: str, *args, **kwargs):
-        snd = self.sender()
-        snd.send_packet(Packet.notify(snd.next_seq(), method, *args, **kwargs))
+        if args and kwargs:
+            raise ValueError('args and kwargs cannot be present at the same time')
+        else:
+            snd = self.sender()
+            snd.send_packet(Packet.request(snd.next_seq(), RPCRequest(method, args = args or kwargs)))
 
     def reply_to(self, p: RPCRequest, *, data: Optional[Any] = None, error: Optional[RPCError] = None):
         snd = self.sender()
-        snd.send_packet(Packet.response(snd.next_seq(), p.id, data = data, error = error))
+        snd.send_packet(Packet.response(snd.next_seq(), RPCResponse(p.id, data = data, error = error)))
 
     def handle_response(self, p: RPCResponse):
         pid = p.id

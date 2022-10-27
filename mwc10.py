@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import sys
 import time
 import json
 import base64
-import struct
-import hashlib
 import asyncio
 import logging
 import argparse
@@ -19,7 +15,6 @@ from functools import cached_property
 from typing import Any
 from typing import Union
 from typing import Optional
-from typing import Sequence
 
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -45,7 +40,11 @@ from miot import MiotRPC
 from miot import MiotApplication
 from miot import MiotConfiguration
 
-from disco import Configuration
+from mwc11 import MWC11
+from mwc11 import STATION_BIND
+from mwc11 import STATION_PORT
+from mwc1x import Configuration
+from mwc1x import ConfigurationFile
 
 HW_VER       = 'Linux'
 FW_VER       = '4.1.6_1999'
@@ -231,50 +230,62 @@ class GatewayProperties(Properties):
             },
         }
 
-class KeyStore:
-    @cached_property
-    def static_keys(self) -> dict[int, str]:
-        return {}
-
-    def create_static_key(self) -> tuple[int, str]:
-        kbuf = self.static_keys
-        seed, = struct.unpack('I', os.urandom(4))
-
-        # avoid seed confliction
-        while seed in kbuf:
-            seed, = struct.unpack('I', os.urandom(4))
-
-        # calculate the static key and save to key store
-        skey = hashlib.md5(b'XMITECH%x' % seed).hexdigest()[:16]
-        kbuf[seed] = skey
-        return seed, skey
-
 class MiotApp(MiotApplication):
     did       : int
+    cam       : MWC11
     log       : Logger
     rpc       : MiotRPC
     cfg       : Configuration
-    keys      : KeyStore
     uptime    : int
     gw_props  : GatewayProperties
     cam_props : dict[str, CameraProperties]
 
+    __arguments__ = [
+        ('-c', '--config', dict(
+            help    = 'config file path',
+            type    = str,
+            metavar = 'FILE',
+            default = 'mwc1x.json',
+        )),
+        ('--mwc11-bind', dict(
+            help    = 'MWC11 bind address',
+            type    = str,
+            metavar = 'BIND',
+            default = STATION_BIND,
+        )),
+        ('--mwc11-port', dict(
+            help    = 'MWC11 bind port',
+            type    = int,
+            metavar = 'PORT',
+            default = STATION_PORT,
+        )),
+    ]
+
     def __init__(self, rpc: MiotRPC, cfg: MiotConfiguration):
+        d = self.__arguments__
         p = argparse.ArgumentParser('mwc10')
-        p.add_argument('-c', '--config', metavar = 'FILE', type = str, help = 'config file path', default = 'mwc10.json')
 
-        # read and parse the file
-        with open(p.parse_args(cfg.args).config) as fp:
-            self.cfg = Configuration.from_dict(Payload.type_checked(json.load(fp), dict))
+        # add argumnets
+        for v in d:
+            p.add_argument(*v[:-1], **v[-1])
 
-        # initialize remaining properties
+        # parse the options
+        ns = p.parse_args(cfg.args)
+        fn, bind, port = ns.config, ns.mwc11_bind, ns.mwc11_port
+
+        # initialize the application
         self.rpc       = rpc
+        self.cfg       = ConfigurationFile.load(fn)
+        self.cam       = MWC11(rpc, self.cfg)
         self.did       = cfg.security_provider.device_id
         self.log       = logging.getLogger('mwc10')
-        self.keys      = KeyStore()
         self.uptime    = cfg.uptime
         self.gw_props  = GatewayProperties()
         self.cam_props = {}
+
+        # start the MWC11 client
+        loop = asyncio.get_running_loop()
+        loop.create_task(self.cam.serve_forever(bind, port))
 
     @classmethod
     def device_model(cls) -> str:
@@ -356,8 +367,8 @@ class MiotApp(MiotApplication):
         pass
 
     async def _rpc_get_gwinfo(self, p: RPCRequest):
-        pkey = base64.b64decode(Payload.type_checked(p.args['app_pub_key'], str).encode('utf-8'))
-        seed, mkey = self.keys.create_static_key()
+        pkey = base64.b64decode(Payload.type_checked(p.args['app_pub_key'], str))
+        skey = self.cfg.new_static_key()
 
         # compose the plain text
         data = json.dumps(
@@ -365,8 +376,8 @@ class MiotApp(MiotApplication):
             obj        = {
                 'ssid'           : self.cfg.ap.ssid,
                 'passwd'         : self.cfg.ap.passwd,
-                'static_key'     : mkey,
-                'static_key_num' : seed,
+                'static_key'     : skey.key,
+                'static_key_num' : skey,
             },
         )
 

@@ -1,53 +1,54 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import json
-import base64
-import socket
+import time
 import struct
-import hashlib
 import asyncio
 import hexdump
 import logging
-import coloredlogs
 
-from udp import UdpSocket
 from enum import IntEnum
 from logging import Logger
 
-from miot import Payload
-
-from typing import Any
 from typing import Iterable
 from typing import Optional
 
 from asyncio import Queue
-from asyncio import TimerHandle
+from asyncio import Protocol
 from asyncio import StreamReader
 from asyncio import StreamWriter
+from asyncio import WriteTransport
 
-from cryptography.hazmat.primitives.ciphers import Cipher
-from cryptography.hazmat.primitives.ciphers import CipherContext
+from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from cryptography.hazmat.primitives.ciphers.modes import CBC
-from cryptography.hazmat.primitives.ciphers.algorithms import AES128
+from cryptography.hazmat.primitives.asymmetric.ec import ECDH
+from cryptography.hazmat.primitives.asymmetric.ec import SECP256R1
+from cryptography.hazmat.primitives.asymmetric.ec import generate_private_key
+from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey
+
+from cryptography.hazmat.primitives._serialization import Encoding
+from cryptography.hazmat.primitives._serialization import PublicFormat
+
+from miot import MiotRPC
+from miot import RPCRequest
+
+from mwc1x import StaticKey
+from mwc1x import SessionKey
+from mwc1x import Configuration
 
 LOG_FMT         = '%(asctime)s %(name)s [%(levelname)s] %(message)s'
 LOG_LEVEL       = logging.DEBUG
 
-MUX_TIMEOUT     = 10
-PROTOCOL_VER    = 2
-
-DSP_COMM_PORT   = 32290
-COM_SEND_PORT   = 32293
-COM_RECV_PORT   = 32295
-UDP_COMM_PORT   = 32392
-VIDEO_FEED_PORT = 32380
+PROTO_VER       = 2
+STATION_PORT    = 6282
+STATION_BIND    = '0.0.0.0'
 
 SECRET_MAGIC    = 0xee00ff11
 STREAM_MAGIC    = 0x55aa55aa
 SENDER_MAGIC    = 0xff00aaaa
 RECVER_MAGIC    = 0xff005555
+MALPHA_MAGIC    = 0xaabb1122
 
 class FrameCmd(IntEnum):
     Video01     = 0x01
@@ -208,83 +209,6 @@ class PacketCmd(IntEnum):
     BindResult                      = 0x12e
     StaticIPAssigned                = 0x12f
 
-class Key:
-    num: int
-    oob: str
-    key: bytes
-
-    def __init__(self, key: bytes, oob: str, num: int):
-        self.key = key
-        self.oob = oob
-        self.num = num
-
-    def __repr__(self) -> str:
-        return '\n'.join([
-            'Key {',
-            '    key = %s' % self.key.hex(),
-            '    oob = %s' % self.oob,
-            '    num = %d' % self.num,
-            '}',
-        ])
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            'num': self.num,
-            'oob': self.oob,
-            'key': base64.b64encode(self.key).decode('utf-8'),
-        }
-
-    def encrypt(self, data: bytes) -> bytes:
-        pad = (16 - len(data) % 16) % 16
-        aes = Cipher(AES128(self.key), CBC(bytes(16))).encryptor()
-        return aes.update(data) + aes.update(b'\x00' * pad) + aes.finalize()
-
-    def decrypt(self, data: bytes, size: int) -> bytes:
-        aes = Cipher(AES128(self.key), CBC(bytes(16))).decryptor()
-        buf = aes.update(data) + aes.finalize()
-        return buf[:size]
-
-    def unbind_token(self,  addr: str, port: int) -> bytes:
-        return hashlib.md5(self.encrypt(socket.inet_aton(addr) + port.to_bytes(2, 'little'))).digest()
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> 'Key':
-        return cls(
-            num = Payload.type_checked(data['num'], 'int'),
-            oob = Payload.type_checked(data['oob'], 'str'),
-            key = base64.b64decode(Payload.type_checked(data['key'], 'str').encode('utf-8')),
-        )
-
-class KeyStore:
-    file: str
-    keys: dict[str, Key]
-
-    def __init__(self, keys: dict[str, Key], *, file: str = 'mwc11.json'):
-        self.file = file
-        self.keys = keys
-
-    def save(self):
-        with open(self.file, 'w') as fp:
-            json.dump(self, fp, indent = 4, sort_keys = True)
-
-    def find(self, addr: str) -> Optional[Key]:
-        return self.keys.get(addr)
-
-    def update(self, addr: str, key: Key):
-        self.keys[addr] = key
-        self.save()
-
-    @classmethod
-    def load(cls, file: str = 'mwc11.json') -> 'KeyStore':
-        try:
-            with open(file) as fp:
-                data = Payload.type_checked(json.load(fp), dict)
-                keys = { k: Key.from_dict(Payload.type_checked(v, dict)) for k, v in data.items() }
-        except (TypeError, ValueError, FileNotFoundError):
-            return cls({}, file = file)
-        else:
-            return cls(keys, file = file)
-
 class Frame:
     type    : FrameCmd
     index   : int
@@ -333,7 +257,8 @@ class Packet:
         return ('\n' + ' ' * 12).join(hexdump.hexdump(self.data, result = 'generator'))
 
 class FrameSerdes:
-    def decode(self, buf: bytes, key: Key) -> Iterable[Frame]:
+    @staticmethod
+    def decode(buf: bytes, key: SessionKey) -> Iterable[Frame]:
         while len(buf) >= 24:
             hdr = buf[:24]
             magic, ty, seq, size = struct.unpack('IxBH4xH10x', hdr)
@@ -363,7 +288,8 @@ class FrameSerdes:
             yield Frame(FrameCmd(ty), seq, rbuf)
 
 class PacketSerdes:
-    async def read(self, rd: StreamReader, key: Optional[Key] = None) -> Packet:
+    @staticmethod
+    async def read(rd: StreamReader, *, key: Optional[SessionKey] = None) -> Packet:
         data = await rd.readexactly(4)
         magic, = struct.unpack('I', data)
 
@@ -396,25 +322,23 @@ class PacketSerdes:
         if size == 0:
             return Packet(ver, cmd, sig)
 
-        # unencrypted data, just read the body
-        if cmd == PacketCmd.StaticIPAssigned:
-            return Packet(ver, cmd, sig, await rd.readexactly(size))
-
         # special case of the initial key exchange packet
         if cmd == PacketCmd.ExchangeBindInfo:
             ext = await rd.readexactly(140)
-            key, size = Key(ext[:16], '', 0), struct.unpack('136xI', ext)[0]
+            key, size = SessionKey(ext[:16]), struct.unpack('136xI', ext)[0]
+
+        # unencrypted data, just read the body
+        if key is None:
+            return Packet(ver, cmd, sig, await rd.readexactly(size))
 
         # add padding size, read and decrypt the body
         rbuf = await rd.readexactly((((size - 1) >> 4) + 1) << 4)
-        return Packet(ver, cmd, sig, ext + (key.decrypt(rbuf, size) if key else rbuf))
+        return Packet(ver, cmd, sig, ext + key.decrypt(rbuf, size))
 
-    async def write(self, wr: StreamWriter, key: Key, frame: Packet):
-        await wr.write(b''.join((
-            struct.pack('IIII', SENDER_MAGIC, frame.cmd, len(frame.data), frame.ver),
-            frame.token,
-            key.encrypt(frame.data),
-        )))
+    @staticmethod
+    def write(wr: StreamWriter, frame: Packet, *, key: Optional[SessionKey] = None):
+        mm = struct.pack('IIII16s', SENDER_MAGIC, frame.cmd, len(frame.data), frame.ver, frame.token)
+        wr.write(mm + (frame.data if key is None else key.encrypt(frame.data)))
 
 class FrameDemux:
     log    : Logger
@@ -473,159 +397,345 @@ class FrameDemux:
         self._handle_signaling_frame(frame)
         self.frames.put_nowait(frame)
 
-class Connection:
-    log      : Logger
-    key      : Optional[Key]
-    keys     : KeyStore
-    dmux     : FrameDemux
-    udps     : FrameSerdes
-    srds     : PacketSerdes
-    com_recv : Optional[StreamReader]
-    com_send : Optional[StreamWriter]
-    dsp_comm : Optional[StreamWriter]
-    udp_comm : Optional[StreamWriter]
+class MuxType(IntEnum):
+    StaInit = 0
+    UdpData = 1
+    ComData = 2
+    DspComm = 3
+    UdpComm = 4
 
-    def __init__(self, addr: str, keys: KeyStore):
-        self.key      = keys.find(addr)
-        self.log      = logging.getLogger('mwc11.conn.' + addr.replace('.', '_'))
-        self.keys     = keys
-        self.dmux     = FrameDemux()
-        self.udps     = FrameSerdes()
-        self.srds     = PacketSerdes()
-        self.com_recv = None
-        self.com_send = None
-        self.dsp_comm = None
-        self.udp_comm = None
+class MuxFrame:
+    ty  : MuxType
+    buf : bytes
 
-    @property
-    def ready(self) -> bool:
-        return self.com_send is not None and self.com_recv is not None
+    def __init__(self, ty: MuxType, buf: bytes = b''):
+        self.ty  = ty
+        self.buf = buf
+
+    def __repr__(self) -> str:
+        return '\n'.join([
+            'MuxFrame {',
+            '    ty  = %s' % self.ty,
+            '    buf = %s' % (self.buf and self._dump_buf() or '(empty)'),
+            '}',
+        ])
+
+    def _dump_buf(self) -> str:
+        return ('\n' + ' ' * 10).join(hexdump.hexdump(self.buf, result = 'generator'))
+
+    def to_bytes(self) -> bytes:
+        return struct.pack('>IB', self.ty, len(self.buf)) + self.buf
+
+    @classmethod
+    async def read(cls, rd: StreamReader) -> 'MuxFrame':
+        hdr = await rd.readexactly(5)
+        tyv, nb = struct.unpack('>BI', hdr)
+
+        # parse the mux type, and read the body
+        try:
+            ty = MuxType(tyv)
+        except ValueError:
+            raise ValueError('invalid packet type %#04x') from None
+        else:
+            return cls(ty, await rd.readexactly(nb))
+
+class MuxTransport(WriteTransport):
+    ty  : MuxType
+    wr  : StreamWriter
+    log : Logger
+
+    def __init__(self, ty: MuxType, wr: StreamWriter):
+        self.ty  = ty
+        self.wr  = wr
+        self.log = logging.getLogger('mwc11.mux')
+        super().__init__(None)
+
+    def set_write_buffer_limits(self, high: Optional[int] = None, low: Optional[int] = None):
+        self.wr.transport.set_write_buffer_limits(high, low)
+
+    def get_write_buffer_size(self) -> int:
+        return self.wr.transport.get_write_buffer_size()
+
+    def get_write_buffer_limits(self) -> tuple[int, int]:
+        return self.wr.transport.get_write_buffer_limits()
+
+    def write(self, data: bytes):
+        t = time.monotonic_ns()
+        self.wr.write(struct.pack('>BI', self.ty, len(data)) + data)
+        self.log.debug('Packet %s was transmitted in %.3fms.', self.ty, (time.monotonic_ns() - t) / 1e6)
+
+    def write_eof(self):
+        self.wr.transport.write_eof()
+
+    def can_write_eof(self) -> bool:
+        return self.wr.transport.can_write_eof()
+
+    def abort(self):
+        self.wr.transport.abort()
+
+class MuxConnection:
+    rd  : StreamReader
+    wr  : StreamWriter
+    log : Logger
+    mux : dict[MuxType, tuple[StreamReader, StreamWriter]]
+
+    def __init__(self, rd: StreamReader, wr: StreamWriter):
+        self.rd  = rd
+        self.wr  = wr
+        self.log = logging.getLogger('mwc11.mux')
+        self.mux = { t: self._new_chan(t, wr) for t in MuxType }
+
+    @staticmethod
+    def _new_chan(ty: MuxType, wr: StreamWriter) -> tuple[StreamReader, StreamWriter]:
+        rd = StreamReader(loop = asyncio.get_running_loop())
+        wr = StreamWriter(MuxTransport(ty, wr), Protocol(), rd, asyncio.get_running_loop())
+        return rd, wr
 
     def close(self):
-        for conn in (self.com_send, self.dsp_comm, self.udp_comm):
-            if conn is not None:
-                conn.close()
+        if self.mux:
+            self.wr.close()
+            self.mux.clear()
 
-    def handle_udp(self, data: bytes):
-        if self.key is None:
-            self.log.warning('Dropping UDP packets: key is not initialized.')
+    def reader(self, ty: MuxType) -> StreamReader:
+        if not self.mux:
+            raise ConnectionResetError('mux connection closed')
+        elif ty not in self.mux:
+            raise ValueError('invalid frame type %s' % ty)
         else:
-            for frame in self.udps.decode(data, self.key):
-                self.dmux.add_streaming_frame(frame)
+            return self.mux[ty][0]
 
-    async def connection_ready(self):
-        while self.key is None:
-            req = await self.srds.read(self.com_recv)
-            cmd = req.cmd
+    def writer(self, ty: MuxType) -> StreamWriter:
+        if not self.mux:
+            raise ConnectionResetError('mux connection closed')
+        elif ty not in self.mux:
+            raise ValueError('invalid frame type %s' % ty)
+        else:
+            return self.mux[ty][1]
 
-    async def _perform_handshake(self):
-        pass
+    async def run(self):
+        while self.mux:
+            try:
+                req = await MuxFrame.read(self.rd)
+            except EOFError:
+                if self.mux:
+                    self.close()
+                    self.log.error('EOF when reading frames, closing connection.')
+            except Exception as e:
+                if self.mux:
+                    self.close()
+                    self.log.warning('Error when reading frames, closing connection. Error: %s', e)
+            else:
+                if self.mux:
+                    if req.ty not in self.mux:
+                        self.log.warning('Invalid frame type %s, dropped.', req.ty)
+                    else:
+                        self.log.debug('Received a packet with type %s.', req.ty.name)
+                        self.mux[req.ty][0].feed_data(req.buf)
 
-    async def _dispatch_requests(self):
-        pass
+class Connection:
+    mac  : bytes
+    log  : Logger
+    key  : SessionKey
+    mux  : MuxConnection
+    dmux : FrameDemux
 
-class MWC11:
-    log    : Logger
-    keys   : KeyStore
-    conn   : dict[str, Connection]
-    waiter : dict[str, tuple[TimerHandle, Connection]]
+    def __init__(self, mac: bytes, key: SessionKey, mux: MuxConnection):
+        self.mac  = mac
+        self.key  = key
+        self.mux  = mux
+        self.log  = logging.getLogger('mwc11.conn.' + mac.hex('-'))
+        self.dmux = FrameDemux()
 
-    def __init__(self, keys: KeyStore):
-        self.log    = logging.getLogger('mwc10.station')
-        self.keys   = keys
-        self.conn   = {}
-        self.waiter = {}
+    async def run(self):
+        while True:
+            rd = self.mux.reader(MuxType.ComData)
+            req = await PacketSerdes.read(rd, key = self.key)
+            print('mwc11', req)
 
-    async def serve_forever(self, host: str = '0.0.0.0'):
-        loop = asyncio.get_running_loop()
-        udps = await UdpSocket.new((host, VIDEO_FEED_PORT))
-        dspr = await asyncio.start_server(self._serve_dsp_comm, host = host, port = DSP_COMM_PORT)
-        udpc = await asyncio.start_server(self._serve_udp_comm, host = host, port = UDP_COMM_PORT)
-        send = await asyncio.start_server(self._serve_com_send, host = host, port = COM_SEND_PORT)
-        recv = await asyncio.start_server(self._serve_com_recv, host = host, port = COM_RECV_PORT)
+class DeviceBinder:
+    mac: bytes
+    log: Logger
+    rpc: MiotRPC
+    mux: MuxConnection
+    cfg: Configuration
+    key: Optional[StaticKey]
 
-        # wait for all services
-        await asyncio.wait(
-            return_when = asyncio.FIRST_COMPLETED,
-            fs          = [
-                loop.create_task(dspr.serve_forever()),
-                loop.create_task(udpc.serve_forever()),
-                loop.create_task(send.serve_forever()),
-                loop.create_task(recv.serve_forever()),
-                loop.create_task(self._dispatch_udp_packets(udps)),
-            ],
+    # curve and key size
+    __curve__    = SECP256R1()
+    __key_size__ = (__curve__.key_size * 2) // 8 + 1
+
+    def __init__(self,
+        mac: bytes,
+        rpc: MiotRPC,
+        mux: MuxConnection,
+        cfg: Configuration,
+    ):
+        self.mac = mac
+        self.rpc = rpc
+        self.mux = mux
+        self.cfg = cfg
+        self.key = None
+        self.log = logging.getLogger('mwc11.bind')
+
+    def _drop_key(self):
+        if self.key is not None:
+            self.cfg.drop_static_key(self.key)
+
+    async def _wait_cmd(self, *cmds: PacketCmd, key: Optional[SessionKey] = None) -> Packet:
+        while True:
+            rd = self.mux.reader(MuxType.ComData)
+            req = await PacketSerdes.read(rd, key = key)
+
+            # wait for the expected command
+            if req.cmd in cmds:
+                return req
+            else:
+                self.log.debug('Dropping unexpected packet: %s', req)
+
+    async def _bind_device(self) -> SessionKey:
+        req = await self._wait_cmd(PacketCmd.ExchangeBindInfo)
+        pkey, skid = struct.unpack('128s4xI4x', req.data[:140])
+
+        # store the static key
+        self.key = skid
+        self.log.info('Start binding procedure for "%s".', self.mac.hex(':'))
+
+        # perform ECDHE key exchange
+        pkey = pkey[:self.__key_size__]
+        nkey = generate_private_key(self.__curve__)
+        rkey = nkey.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+        skey = nkey.exchange(ECDH(), EllipticCurvePublicKey.from_encoded_point(self.__curve__, pkey))
+
+        # check for static key ID
+        if skid not in self.cfg.static_keys:
+            raise ValueError('static key %d not found' % skid)
+
+        # calculate the AES key
+        salt = StaticKey(skid).key.encode('utf-8')
+        ekey = SessionKey(HKDF(SHA256(), 16, salt, b'xmitech-auth-srv').derive(skey))
+
+        # parse the RPC request
+        req = RPCRequest.from_bytes(req.data[140:])
+        self.log.info('Requesting binding information for "%s".', self.mac.hex(':'))
+
+        # proxy the RPC request
+        resp = await self.rpc.proxy(req)
+        error = resp.error
+
+        # check for RPC errors
+        if error is not None:
+            self.log.warning('RPC error when requesting binding information. Error: %s', resp.error)
+
+        # construct the response
+        data = resp.to_bytes()
+        data = struct.pack('128sIIII4x', pkey, len(pkey), len(data) + 12, MALPHA_MAGIC, len(data)) + data
+        sbuf = struct.pack('III20x128sI', SENDER_MAGIC, PacketCmd.ExchangeBindInfo, len(data) + 132, rkey, len(rkey))
+
+        # send it back
+        self.mux.writer(MuxType.ComData).write(sbuf + ekey.encrypt(data))
+        self.log.info('Binding information was sent to "%s", waiting for response.', self.mac.hex(':'))
+
+        # wait for the response
+        req = await asyncio.wait_for(
+            fut     = self._wait_cmd(PacketCmd.BindResult, PacketCmd.ConfirmBindInfo, key = ekey),
+            timeout = 10.0,
         )
 
-    def _add_conn(self, addr: str) -> Connection:
-        con = Connection(addr, self.keys)
-        tmr = asyncio.get_running_loop().call_later(MUX_TIMEOUT, self._cancel_conn, addr)
-        self.waiter[addr] = (tmr, con)
-        return con
+        # should not occure here, but still possible, so handle it
+        if req.cmd == PacketCmd.BindResult:
+            self.log.warning('Premature bind result, treated as error: %s', req)
+            raise ValueError('unexpected packet')
 
-    def _cancel_conn(self, addr: str):
-        buf = self.waiter
-        tmr, conn = buf.pop(addr, (None, None))
+        # parse the packet
+        buf = memoryview(req.data)
+        pkey, buf = bytes(buf[:128]), buf[128:]
+        plen, buf = struct.unpack_from('I', buf, 0)[0], buf[4:]
+        desc, buf = bytes(buf[:16]), buf[16:]
+        skey, buf = bytes(buf[:16]), buf[16:]
+        info, buf = bytes(buf[:256]), buf[256:]
+        rlen, buf = struct.unpack_from('I', buf, 0)[0], buf[4:]
 
-        # drop the connection if needed
-        if tmr and conn:
-            tmr.cancel()
-            conn.close()
-            self.log.error('Aggregation timeout, connection "%s" was dropped.', addr)
+        # check for remaining data
+        if len(buf) != rlen:
+            self.log.warning('Discarding garbage data:\n%s', hexdump.hexdump(buf[rlen:], 'return'))
 
-    def _dispatch_conn(self, kind: str, wr: StreamWriter, attr: str, value: Any):
-        addr = wr.transport.get_extra_info('peername')[0]
-        conn = self.conn.get(addr)
+        # parse the RPC request
+        req = RPCRequest.from_bytes(bytes(buf))
+        self.log.info('Confirming binding information for "%s".', self.mac.hex(':'))
 
-        # if not found, attempt to find a pending connection
-        if conn is None:
-            _, conn = self.waiter.get(addr, (None, None))
+        # proxy the RPC request
+        resp = await self.rpc.proxy(req)
+        error = resp.error
 
-        # if still not found, create a new connection
-        if conn is None:
-            conn = self._add_conn(addr)
-            self.log.info('New connection "%s".', addr)
+        # check for RPC errors
+        if error is not None:
+            self.log.warning('RPC error when confirming binding information. Error: %s', resp.error)
 
-        # update the attribute
-        setattr(conn, attr, value)
-        self.log.info('Link %s connection to "%s".', kind, addr)
+        # build the frame
+        data = resp.to_bytes()
+        data = struct.pack('II4x', MALPHA_MAGIC, len(data)) + data
+        data = Packet(0, PacketCmd.ConfirmBindInfo, bytes(16), data)
 
-        # check if the connection is ready
-        if not conn.ready:
-            return
-        else:
-            self.log.info('Connection "%s" is ready.', addr)
+        # send it back
+        PacketSerdes.write(self.mux.writer(MuxType.ComData), data, key = ekey)
+        self.log.info('Binding confirmation was sent to "%s", waiting for response.', self.mac.hex(':'))
 
-        # remove the connection from pending list into connection list
-        tmr, conn = self.waiter.pop(addr)
-        self.conn[addr] = conn
+        # wait for bind result
+        req = await self._wait_cmd(PacketCmd.BindResult, key = ekey)
+        code, = struct.unpack('i', req.data)
 
-        # notify the connection
-        tmr.cancel()
-        asyncio.create_task(conn.connection_ready())
+        # check for error code
+        if code != 0:
+            self.log.error('Bind error with code %d.', code)
+            raise ValueError('bind error with code %d' % code)
 
-    async def _serve_dsp_comm(self, _: StreamReader, wr: StreamWriter):
-        self._dispatch_conn('DSP Signaling', wr, 'dsp_comm', wr)
+        # bind successful
+        self.log.info('Bind successful.')
+        return ekey
 
-    async def _serve_udp_comm(self, _: StreamReader, wr: StreamWriter):
-        self._dispatch_conn('Upstream Audio', wr, 'udp_comm', wr)
+    async def bind(self) -> SessionKey:
+        try:
+            return await self._bind_device()
+        except Exception:
+            self._drop_key()
+            raise
 
-    async def _serve_com_send(self, _: StreamReader, wr: StreamWriter):
-        self._dispatch_conn('Upstream Signaling', wr, 'com_send', wr)
+class MWC11:
+    log: Logger
+    rpc: MiotRPC
+    cfg: Configuration
 
-    async def _serve_com_recv(self, rd: StreamReader, wr: StreamWriter):
-        self._dispatch_conn('Downstream Signaling', wr, 'com_recv', rd)
+    def __init__(self, rpc: MiotRPC, cfg: Configuration):
+        self.cfg = cfg
+        self.rpc = rpc
+        self.log = logging.getLogger('mwc11.station')
 
-    async def _dispatch_udp_packets(self, udp: UdpSocket):
-        while True:
-            data, addr = await udp.recvfrom()
-            addr, port = addr
+    async def serve_forever(self, host: str = STATION_BIND, port: int = STATION_PORT):
+        srv = await asyncio.start_server(self._handle_connection, host = host, port = port)
+        await srv.serve_forever()
 
-            # check for connection
-            if addr not in self.conn:
-                self.log.warning('Unexpected UDP packet from %s:%d, dropped.', addr, port)
-            else:
-                self.conn[addr].handle_udp(data)
+    async def _handle_connection(self, rd: StreamReader, wr: StreamWriter):
+        mux = MuxConnection(rd, wr)
+        asyncio.get_running_loop().create_task(mux.run())
 
-if __name__ == '__main__':
-    coloredlogs.install(fmt = LOG_FMT, level = LOG_LEVEL, milliseconds = True)
-    asyncio.run(MWC11(KeyStore.load()).serve_forever())
+        # read the MAC address, and find the session key
+        mac = await mux.reader(MuxType.StaInit).readexactly(6)
+        key = self.cfg.find_session_key(mac)
+
+        # bind the device if needed
+        if key is None:
+            try:
+                key = await DeviceBinder(mac, self.rpc, mux, self.cfg).bind()
+                self.cfg.update_session_key(mac, key)
+            except ValueError as e:
+                mux.close()
+                self.log.error('Cannot register device "%s": %s', mac.hex(':'), e)
+                return
+            except TimeoutError:
+                mux.close()
+                self.log.error('Cannot register device "%s": timeout.', mac.hex(':'))
+                return
+
+        # start the connection
+        conn = Connection(mac, key, mux)
+        await conn.run()
