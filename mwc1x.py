@@ -234,13 +234,13 @@ class Configuration:
     def __init__(self,
         ap             : ApConfiguration,
         station        : StationConfiguration,
-        devices        : dict[bytes, DeviceConfiguration],
         *,
+        devices        : Optional[dict[bytes, DeviceConfiguration]] = None,
         event_listener : Optional[EventListener] = None,
     ):
         self.ap             = ap
         self.station        = station
-        self.devices        = devices
+        self.devices        = devices or {}
         self.static_keys    = set()
         self.event_listener = event_listener
 

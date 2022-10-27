@@ -39,6 +39,16 @@ from mwc1x import DeviceInfo
 from mwc1x import Configuration
 from mwc1x import DeviceConfiguration
 
+from props import Properties
+from props import ConstProperty
+
+from props import OTAPIID
+from props import CameraSIID
+from props import DetectionPIID
+from props import CameraMiscPIID
+from props import CameraControlPIID
+from props import DetectionMiscPIID
+
 LOG_FMT         = '%(asctime)s %(name)s [%(levelname)s] %(message)s'
 LOG_LEVEL       = logging.DEBUG
 
@@ -534,19 +544,57 @@ class MuxConnection:
                         self.log.debug('Received a packet with type %s.', req.ty.name)
                         self.mux[req.ty][0].feed_data(req.buf)
 
-class Connection:
-    mac  : bytes
-    log  : Logger
-    mux  : MuxConnection
-    dev  : DeviceConfiguration
-    dmux : FrameDemux
+class ConnectionEventListener:
+    def on_disconnected(self, conn: 'Connection'):
+        raise NotImplementedError('on_disconnected()', conn)
 
-    def __init__(self, mac: bytes, mux: MuxConnection, dev: DeviceConfiguration):
-        self.mac  = mac
-        self.mux  = mux
-        self.dev  = dev
-        self.log  = logging.getLogger('mwc11.conn.' + mac.hex('-'))
-        self.dmux = FrameDemux()
+class Connection:
+    mac            : bytes
+    log            : Logger
+    mux            : MuxConnection
+    dev            : DeviceConfiguration
+    props          : Properties
+    demux          : FrameDemux
+    event_listener : Optional[ConnectionEventListener]
+
+    def __init__(self,
+        mac            : bytes,
+        mux            : MuxConnection,
+        dev            : DeviceConfiguration,
+        *,
+        event_listener : Optional[ConnectionEventListener] = None,
+    ):
+        self.mac            = mac
+        self.mux            = mux
+        self.dev            = dev
+        self.log            = logging.getLogger('mwc11.conn.' + mac.hex('-'))
+        self.demux          = FrameDemux()
+        self.event_listener = event_listener
+
+        # initialize properties
+        self.props = Properties(
+            ConstProperty ( CameraSIID.Control       , CameraControlPIID.PowerSwitch   , True   ),
+            ConstProperty ( CameraSIID.Control       , CameraControlPIID.Flip          , 0      ),
+            ConstProperty ( CameraSIID.Control       , CameraControlPIID.NightVision   , 2      ),
+            ConstProperty ( CameraSIID.Control       , CameraControlPIID.OSDTimestamp  , True   ),
+            ConstProperty ( CameraSIID.Control       , CameraControlPIID.WDR           , True   ),
+            ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.LED              , True   ),
+            ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.LiveStream       , 0      ),
+            ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.Distortion       , True   ),
+            ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.BatteryLevel     , 100    ),
+            ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.Resolution       , 0      ),
+            ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.RSSI             , -100   ),
+            ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.Online           , False  ),
+            ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.PowerFreq        , 50     ),
+            ConstProperty ( CameraSIID.DetectionMisc , DetectionMiscPIID.RecordFreq    , 0      ),
+            ConstProperty ( CameraSIID.DetectionMisc , DetectionMiscPIID.RecordLimit   , 10     ),
+            ConstProperty ( CameraSIID.DetectionMisc , DetectionMiscPIID.Enabled       , True   ),
+            ConstProperty ( CameraSIID.Detection     , DetectionPIID.Enabled           , True   ),
+            ConstProperty ( CameraSIID.Detection     , DetectionPIID.RecordInterval    , 30     ),
+            ConstProperty ( CameraSIID.Detection     , DetectionPIID.RecordSensitivity , 100    ),
+            ConstProperty ( CameraSIID.OTA           , OTAPIID.Progress                , 100    ),
+            ConstProperty ( CameraSIID.OTA           , OTAPIID.State                   , 'idle' ),
+        )
 
     async def run(self):
         while True:
@@ -708,15 +756,27 @@ class DeviceBinder:
         finally:
             self._drop_key()
 
-class MWC11:
+class MWC11(ConnectionEventListener):
     log: Logger
     rpc: MiotRPC
     cfg: Configuration
+    cam: dict[bytes, Connection]
 
     def __init__(self, rpc: MiotRPC, cfg: Configuration):
+        self.cam = {}
         self.cfg = cfg
         self.rpc = rpc
         self.log = logging.getLogger('mwc11.station')
+
+    def find(self, did: str) -> Optional[Connection]:
+        for conn in self.cam.values():
+            if conn.dev.info.did == did:
+                return conn
+        else:
+            return None
+
+    def on_disconnected(self, conn: 'Connection'):
+        self.cam.pop(conn.mac, None)
 
     async def serve_forever(self, host: str = STATION_BIND, port: int = STATION_PORT):
         srv = await asyncio.start_server(self._handle_connection, host = host, port = port)
@@ -745,5 +805,6 @@ class MWC11:
                 return
 
         # start the connection
-        conn = Connection(mac, mux, dev)
+        conn = Connection(mac, mux, dev, event_listener = self)
+        self.cam[mac] = conn
         asyncio.get_running_loop().create_task(conn.run())
