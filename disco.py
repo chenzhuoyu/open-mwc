@@ -51,7 +51,7 @@ from cryptography.hazmat.primitives._serialization import PublicFormat
 from mwc1x import MACAddress
 from mwc1x import Configuration
 from mwc1x import ApConfiguration
-from mwc1x import DeviceConfiguration
+from mwc1x import StationConfiguration
 
 LOG_FMT      = '%(asctime)s %(name)s [%(levelname)s] %(message)s'
 LOG_LEVEL    = logging.DEBUG
@@ -560,7 +560,7 @@ class Discovery:
                 ssid   = self.rpc.cfg.ssid,
                 passwd = self.rpc.cfg.passwd,
             ),
-            device = DeviceConfiguration(
+            station = StationConfiguration(
                 did      = self.did,
                 uid      = self.rpc.cfg.uid,
                 mac      = self.mac,

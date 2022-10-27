@@ -312,12 +312,12 @@ class MiotApp(MiotApplication):
             ),
             self.rpc.send('_otc.info',
                 life            = int(time.monotonic() - self.uptime),
-                uid             = self.cfg.device.uid,
+                uid             = self.cfg.station.uid,
                 model           = DEVICE_MODEL,
-                token           = self.cfg.device.bind_key.hex(),
+                token           = self.cfg.station.bind_key.hex(),
                 ipflag          = 1,
                 miio_ver        = MIIO_VER,
-                mac             = self.cfg.device.mac.hex().upper(),
+                mac             = self.cfg.station.mac.hex().upper(),
                 fw_ver          = FW_VER,
                 hw_ver          = HW_VER,
                 miio_client_ver = MIIO_CLI_VER,
@@ -384,7 +384,7 @@ class MiotApp(MiotApplication):
         # generate and exchange keys with ECDH, and derive the encryption key with HKDF
         nkey = generate_private_key(SECP256R1())
         skey = nkey.exchange(ECDH(), EllipticCurvePublicKey.from_encoded_point(SECP256R1(), pkey))
-        aesc = Cipher(AES128(HKDF(SHA256(), 16, self.cfg.device.oob, b'').derive(skey)), CBC(bytes(16))).encryptor()
+        aesc = Cipher(AES128(HKDF(SHA256(), 16, self.cfg.station.oob, b'').derive(skey)), CBC(bytes(16))).encryptor()
 
         # encrypt the response data
         data = data.encode('utf-8')

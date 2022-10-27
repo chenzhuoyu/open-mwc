@@ -53,6 +53,55 @@ class SessionKey(bytes):
     def unbind_token(self,  addr: str, port: int) -> bytes:
         return hashlib.md5(self.encrypt(socket.inet_aton(addr) + port.to_bytes(2, 'little'))).digest()
 
+class DeviceInfo:
+    sn1: str
+    sn2: str
+    did: str
+    mac: bytes
+    oob: bytes
+    psk: bytes
+
+    def __init__(self, sn1: str, sn2: str, did: str, mac: bytes, oob: bytes, psk: bytes):
+        self.sn1 = sn1
+        self.sn2 = sn2
+        self.did = did
+        self.mac = mac
+        self.oob = oob
+        self.psk = psk
+
+    def __str__(self) -> str:
+        return '%s:%s:%s:%s|%s|%s' % (
+            self.sn1,
+            self.sn2,
+            self.oob.decode('utf-8'),
+            self.mac.hex(),
+            self.did,
+            self.psk.decode('utf-8'),
+        )
+
+    def __repr__(self) -> str:
+        return '\n'.join([
+            'DeviceInfo {',
+            '    sn1 = ' + self.sn1,
+            '    sn2 = ' + self.sn2,
+            '    did = ' + self.did,
+            '    mac = ' + self.mac.hex(),
+            '    oob = ' + self.oob.decode('utf-8'),
+            '    psk = ' + self.psk.decode('utf-8'),
+            '}',
+        ])
+
+    @classmethod
+    def parse(cls, info: str) -> 'DeviceInfo':
+        try:
+            val, did, psk = info.split('|')
+            sn1, sn2, oob, mac = val.split(':')
+            mac = MACAddress.parse(mac)
+        except ValueError:
+            raise ValueError('invalid info string ' + repr(info)) from None
+        else:
+            return cls(sn1, sn2, did, mac, oob.encode('utf-8'), psk.encode('utf-8'))
+
 class ApConfiguration:
     ssid   : str
     passwd : str
@@ -83,6 +132,50 @@ class ApConfiguration:
         )
 
 class DeviceConfiguration:
+    info        : DeviceInfo
+    model       : str
+    auth_key    : bytes
+    static_key  : StaticKey
+    session_key : SessionKey
+
+    def __init__(self, info: DeviceInfo, model: str, auth_key: bytes, static_key: StaticKey, session_key: SessionKey):
+        self.info        = info
+        self.model       = model
+        self.auth_key    = auth_key
+        self.static_key  = static_key
+        self.session_key = session_key
+
+    def __repr__(self) -> str:
+        return '\n'.join([
+            'DeviceConfiguration {',
+            '    info        = %s' % self.info,
+            '    model       = %s' % self.model,
+            '    auth_key    = %s' % self.auth_key.hex(),
+            '    static_key  = %d' % self.static_key,
+            '    session_key = %s' % self.session_key.hex(),
+            '}',
+        ])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'info'        : str(self.info),
+            'model'       : self.model,
+            'auth_key'    : base64.b64encode(self.auth_key).decode('utf-8'),
+            'static_key'  : self.static_key,
+            'session_key' : base64.b64encode(self.session_key).decode('utf-8'),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> 'DeviceConfiguration':
+        return cls(
+            info        = DeviceInfo.parse(Payload.type_checked(data['info'], str)),
+            model       = Payload.type_checked(data['model'], str),
+            auth_key    = base64.b64decode(Payload.type_checked(data['auth_key'], str)),
+            static_key  = StaticKey(Payload.type_checked(data['static_key'], int)),
+            session_key = SessionKey(base64.b64decode(Payload.type_checked(data['session_key'], str))),
+        )
+
+class StationConfiguration:
     did      : int
     uid      : int
     mac      : bytes
@@ -93,14 +186,14 @@ class DeviceConfiguration:
     def __init__(self, did: int, uid: int, mac: bytes, oob: bytes, token: bytes, bind_key: bytes):
         self.did      = did
         self.uid      = uid
-        self.mac      = MACAddress.validated(mac)
         self.oob      = oob
+        self.mac      = MACAddress.validated(mac)
         self.token    = token
         self.bind_key = bind_key
 
     def __repr__(self) -> str:
         return '\n'.join([
-            'DeviceConfiguration {',
+            'StationConfiguration {',
             '    did      = %d' % self.did,
             '    uid      = %d' % self.uid,
             '    mac      = %s' % self.mac.hex(':'),
@@ -133,40 +226,33 @@ class DeviceConfiguration:
 
 class Configuration:
     ap             : ApConfiguration
-    device         : DeviceConfiguration
+    station        : StationConfiguration
+    devices        : dict[bytes, DeviceConfiguration]
     static_keys    : set[StaticKey]
-    session_keys   : dict[bytes, SessionKey]
     event_listener : Optional[EventListener]
 
     def __init__(self,
         ap             : ApConfiguration,
-        device         : DeviceConfiguration,
+        station        : StationConfiguration,
+        devices        : dict[bytes, DeviceConfiguration],
         *,
-        static_keys    : Optional[set[StaticKey]] = None,
-        session_keys   : Optional[dict[bytes, SessionKey]] = None,
         event_listener : Optional[EventListener] = None,
     ):
         self.ap             = ap
-        self.device         = device
-        self.static_keys    = static_keys or set()
-        self.session_keys   = session_keys or {}
+        self.station        = station
+        self.devices        = devices
+        self.static_keys    = set()
         self.event_listener = event_listener
 
     def __repr__(self) -> str:
         return '\n'.join([
             'Configuration {',
-            '    ap           = ' + ('\n' + ' ' * 4).join(str(self.ap).splitlines()),
-            '    device       = ' + ('\n' + ' ' * 4).join(str(self.device).splitlines()),
-            '    static_keys  = [',
+            '    ap      = ' + ('\n' + ' ' * 4).join(str(self.ap).splitlines()),
+            '    station = ' + ('\n' + ' ' * 4).join(str(self.station).splitlines()),
+            '    devices = {',
             *(
-                ' ' * 8 + str(v)
-                for v in sorted(self.static_keys)
-            ),
-            '    ]',
-            '    session_keys = {',
-            *(
-                ' ' * 8 + '%s = %s' % (k.hex(':'), ('\n' + ' ' * 12).join(str(v).splitlines()))
-                for k, v in sorted(self.session_keys.items())
+                ' ' * 8 + '%s = %s' % (k.hex(':'), ('\n' + ' ' * 8).join(str(v).splitlines()))
+                for k, v in sorted(self.devices.items())
             ),
             '    }',
             '}',
@@ -178,14 +264,17 @@ class Configuration:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            'ap'           : self.ap.to_dict(),
-            'device'       : self.device.to_dict(),
-            'static_keys'  : sorted(self.static_keys),
-            'session_keys' : {
-                k.hex(':'): base64.b64encode(v).decode('utf-8')
-                for k, v in self.session_keys.items()
-            },
+            'ap'      : self.ap.to_dict(),
+            'station' : self.station.to_dict(),
+            'devices' : {
+                k.hex(':'): v.to_dict()
+                for k, v in self.devices.items()
+            }
         }
+
+    def add_device(self, mac: bytes, dev: DeviceConfiguration):
+        self.devices[mac] = dev
+        self.save()
 
     def new_static_key(self) -> StaticKey:
         val = os.urandom(4)
@@ -198,33 +287,20 @@ class Configuration:
 
         # add to static keys, and save the configuration
         self.static_keys.add(ret)
-        self.save()
         return ret
 
-    def drop_static_key(self, key: StaticKey):
+    def remove_static_key(self, key: StaticKey):
         if key in self.static_keys:
             self.static_keys.remove(key)
-            self.save()
-
-    def find_session_key(self, mac: bytes) -> Optional[SessionKey]:
-        return self.session_keys.get(mac)
-
-    def update_session_key(self, mac: bytes, key: SessionKey):
-        self.session_keys[mac] = key
-        self.save()
 
     @classmethod
     def from_dict(cls, cfg: dict[str, Any], *, event_listener: Optional[EventListener] = None) -> 'Configuration':
         return cls(
             ap             = ApConfiguration.from_dict(Payload.type_checked(cfg['ap'], dict)),
-            device         = DeviceConfiguration.from_dict(Payload.type_checked(cfg['device'], dict)),
-            static_keys    = set(
-                StaticKey(Payload.type_checked(v, int))
-                for v in Payload.type_checked(cfg.get('static_keys', []), list)
-            ),
-            session_keys   = {
-                MACAddress.parse(k): SessionKey(base64.b64decode(Payload.type_checked(v, str)))
-                for k, v in Payload.type_checked(cfg.get('session_keys', {}), dict).items()
+            station        = StationConfiguration.from_dict(Payload.type_checked(cfg['station'], dict)),
+            devices        = {
+                MACAddress.parse(k): DeviceConfiguration.from_dict(v)
+                for k, v in Payload.type_checked(cfg.get('devices', {}), dict).items()
             },
             event_listener = event_listener,
         )

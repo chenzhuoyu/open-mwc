@@ -35,7 +35,9 @@ from miot import RPCRequest
 
 from mwc1x import StaticKey
 from mwc1x import SessionKey
+from mwc1x import DeviceInfo
 from mwc1x import Configuration
+from mwc1x import DeviceConfiguration
 
 LOG_FMT         = '%(asctime)s %(name)s [%(levelname)s] %(message)s'
 LOG_LEVEL       = logging.DEBUG
@@ -192,8 +194,8 @@ class PacketCmd(IntEnum):
     SetPIRZone                      = 0x4f
     PIRZone                         = 0x50
     PushRtSyslog                    = 0x51
-    SetGSensorSWI                   = 0x52
-    GSensorSWI                      = 0x53
+    SetGSensorSwitch                = 0x52
+    GSensorSwitch                   = 0x53
     SetGSensorSensitivity           = 0x54
     GSensorSensitivity              = 0x55
     GSensorEvent                    = 0x56
@@ -535,21 +537,21 @@ class MuxConnection:
 class Connection:
     mac  : bytes
     log  : Logger
-    key  : SessionKey
     mux  : MuxConnection
+    dev  : DeviceConfiguration
     dmux : FrameDemux
 
-    def __init__(self, mac: bytes, key: SessionKey, mux: MuxConnection):
+    def __init__(self, mac: bytes, mux: MuxConnection, dev: DeviceConfiguration):
         self.mac  = mac
-        self.key  = key
         self.mux  = mux
+        self.dev  = dev
         self.log  = logging.getLogger('mwc11.conn.' + mac.hex('-'))
         self.dmux = FrameDemux()
 
     async def run(self):
         while True:
             rd = self.mux.reader(MuxType.ComData)
-            req = await PacketSerdes.read(rd, key = self.key)
+            req = await PacketSerdes.read(rd, key = self.dev.session_key)
             print('mwc11', req)
 
 class DeviceBinder:
@@ -579,7 +581,7 @@ class DeviceBinder:
 
     def _drop_key(self):
         if self.key is not None:
-            self.cfg.drop_static_key(self.key)
+            self.cfg.remove_static_key(self.key)
 
     async def _wait_cmd(self, *cmds: PacketCmd, key: Optional[SessionKey] = None) -> Packet:
         while True:
@@ -592,7 +594,7 @@ class DeviceBinder:
             else:
                 self.log.debug('Dropping unexpected packet: %s', req)
 
-    async def _bind_device(self) -> SessionKey:
+    async def _bind_device(self) -> DeviceConfiguration:
         req = await self._wait_cmd(PacketCmd.ExchangeBindInfo)
         pkey, skid = struct.unpack('128s4xI4x', req.data[:140])
 
@@ -648,16 +650,24 @@ class DeviceBinder:
 
         # parse the packet
         buf = memoryview(req.data)
-        pkey, buf = bytes(buf[:128]), buf[128:]
-        plen, buf = struct.unpack_from('I', buf, 0)[0], buf[4:]
+        xkey, buf = bytes(buf[:128]), buf[128:]
+        xlen, buf = struct.unpack_from('I', buf, 0)[0], buf[4:]
         desc, buf = bytes(buf[:16]), buf[16:]
-        skey, buf = bytes(buf[:16]), buf[16:]
+        akey, buf = bytes(buf[:16]), buf[16:]
         info, buf = bytes(buf[:256]), buf[256:]
         rlen, buf = struct.unpack_from('I', buf, 0)[0], buf[4:]
 
         # check for remaining data
         if len(buf) != rlen:
             self.log.warning('Discarding garbage data:\n%s', hexdump.hexdump(buf[rlen:], 'return'))
+
+        # check the received server public bytes
+        if xkey[:xlen] != rkey:
+            raise ValueError('server public key mismatch.')
+
+        # parse the device info
+        desc = desc.rstrip(b'\x00').decode('utf-8')
+        info = DeviceInfo.parse(info.rstrip(b'\x00').decode('utf-8'))
 
         # parse the RPC request
         req = RPCRequest.from_bytes(bytes(buf))
@@ -686,19 +696,17 @@ class DeviceBinder:
 
         # check for error code
         if code != 0:
-            self.log.error('Bind error with code %d.', code)
             raise ValueError('bind error with code %d' % code)
 
         # bind successful
         self.log.info('Bind successful.')
-        return ekey
+        return DeviceConfiguration(info, desc, akey, StaticKey(skid), ekey)
 
-    async def bind(self) -> SessionKey:
+    async def bind(self) -> DeviceConfiguration:
         try:
             return await self._bind_device()
-        except Exception:
+        finally:
             self._drop_key()
-            raise
 
 class MWC11:
     log: Logger
@@ -720,13 +728,13 @@ class MWC11:
 
         # read the MAC address, and find the session key
         mac = await mux.reader(MuxType.StaInit).readexactly(6)
-        key = self.cfg.find_session_key(mac)
+        dev = self.cfg.devices.get(mac)
 
         # bind the device if needed
-        if key is None:
+        if dev is None:
             try:
-                key = await DeviceBinder(mac, self.rpc, mux, self.cfg).bind()
-                self.cfg.update_session_key(mac, key)
+                dev = await DeviceBinder(mac, self.rpc, mux, self.cfg).bind()
+                self.cfg.add_device(mac, dev)
             except ValueError as e:
                 mux.close()
                 self.log.error('Cannot register device "%s": %s', mac.hex(':'), e)
@@ -737,5 +745,5 @@ class MWC11:
                 return
 
         # start the connection
-        conn = Connection(mac, key, mux)
-        await conn.run()
+        conn = Connection(mac, mux, dev)
+        asyncio.get_running_loop().create_task(conn.run())
