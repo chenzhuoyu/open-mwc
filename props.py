@@ -173,11 +173,7 @@ class Properties:
     def __init__(self, *props: Property):
         self.log   = logging.getLogger('props')
         self.props = {}
-
-        # define all the properties
-        for p in props:
-            self.log.debug('Registering property: %s' % p.name)
-            self.props.setdefault(p.siid, {})[p.piid] = p
+        self.register(*props)
 
     def __getitem__(self, ids: tuple[SIID, PIID]) -> Property:
         if ids[0] not in self.props:
@@ -186,3 +182,8 @@ class Properties:
             raise ValueError('invalid PIID %s for SIID %s' % (ids[1], ids[0]))
         else:
             return self.props[ids[0]][ids[1]]
+
+    def register(self, *props: Property):
+        for p in props:
+            self.log.debug('Registering property: %s' % p.name)
+            self.props.setdefault(p.siid, {})[p.piid] = p

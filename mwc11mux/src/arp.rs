@@ -183,22 +183,22 @@ mod detail {
         while i < len {
             let rtm = buf.byte_add(i) as *const rtm::rt_msghdr;
             let sin = rtm.byte_add(RTM_SIZE) as *const sockaddr_in;
-            let sdl = sin.byte_add((&*sin).sin_len as usize) as *const sockaddr_dl;
+            let sdl = sin.byte_add((*sin).sin_len as usize) as *const sockaddr_dl;
 
             /* check if the address is complete and matches the requested address */
-            if (&*sdl).sdl_alen == 0 || (&*sin).sin_addr.s_addr != addr {
-                i += (&*rtm).rtm_msglen as usize;
+            if (*sdl).sdl_alen == 0 || (*sin).sin_addr.s_addr != addr {
+                i += (*rtm).rtm_msglen as usize;
                 continue;
             }
 
             /* copy the MAC address */
             let mac = MACAddress::new([
-                (&*sdl).sdl_data[(&*sdl).sdl_nlen as usize] as u8,
-                (&*sdl).sdl_data[(&*sdl).sdl_nlen as usize + 1] as u8,
-                (&*sdl).sdl_data[(&*sdl).sdl_nlen as usize + 2] as u8,
-                (&*sdl).sdl_data[(&*sdl).sdl_nlen as usize + 3] as u8,
-                (&*sdl).sdl_data[(&*sdl).sdl_nlen as usize + 4] as u8,
-                (&*sdl).sdl_data[(&*sdl).sdl_nlen as usize + 5] as u8,
+                (*sdl).sdl_data[(*sdl).sdl_nlen as usize] as u8,
+                (*sdl).sdl_data[(*sdl).sdl_nlen as usize + 1] as u8,
+                (*sdl).sdl_data[(*sdl).sdl_nlen as usize + 2] as u8,
+                (*sdl).sdl_data[(*sdl).sdl_nlen as usize + 3] as u8,
+                (*sdl).sdl_data[(*sdl).sdl_nlen as usize + 4] as u8,
+                (*sdl).sdl_data[(*sdl).sdl_nlen as usize + 5] as u8,
             ]);
 
             /* store the address */
@@ -338,7 +338,7 @@ mod test {
 
     #[test]
     fn test_resolve() -> Unit {
-        let ret = lookup(&Ipv4Addr::from_str(&"172.20.0.158")?)?;
+        let ret = lookup(&Ipv4Addr::from_str("172.20.0.158")?)?;
         dbg!(ret);
         Ok(())
     }

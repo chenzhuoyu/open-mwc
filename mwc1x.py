@@ -50,7 +50,7 @@ class SessionKey(bytes):
         buf = aes.update(data) + aes.finalize()
         return buf[:size]
 
-    def unbind_token(self,  addr: str, port: int) -> bytes:
+    def frame_token(self, addr: str, port: int) -> bytes:
         return hashlib.md5(self.encrypt(socket.inet_aton(addr) + port.to_bytes(2, 'little'))).digest()
 
 class DeviceInfo:

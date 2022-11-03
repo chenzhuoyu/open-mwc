@@ -109,7 +109,7 @@ class MiotApp(MiotApplication):
         self.log    = logging.getLogger('mwc10')
         self.uptime = cfg.uptime
 
-        # initialize properties
+        # initialize all const properties
         self.props = Properties(
             ConstProperty ( StationSIID.CameraControl  , CameraControlPIID.PowerSwitch     , True   ),
             ConstProperty ( StationSIID.CameraControl  , CameraControlPIID.Flip            , 0      ),

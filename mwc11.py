@@ -39,7 +39,7 @@ from mwc1x import DeviceInfo
 from mwc1x import Configuration
 from mwc1x import DeviceConfiguration
 
-from props import Properties
+from props import FuncProperty, Properties
 from props import ConstProperty
 
 from props import OTAPIID
@@ -571,7 +571,7 @@ class Connection:
         self.demux          = FrameDemux()
         self.event_listener = event_listener
 
-        # initialize properties
+        # initialize all const properties
         self.props = Properties(
             ConstProperty ( CameraSIID.Control       , CameraControlPIID.PowerSwitch   , True   ),
             ConstProperty ( CameraSIID.Control       , CameraControlPIID.Flip          , 0      ),
@@ -581,7 +581,6 @@ class Connection:
             ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.LED              , True   ),
             ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.LiveStream       , 0      ),
             ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.Distortion       , True   ),
-            ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.BatteryLevel     , 100    ),
             ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.Resolution       , 0      ),
             ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.RSSI             , -100   ),
             ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.Online           , False  ),
@@ -595,6 +594,22 @@ class Connection:
             ConstProperty ( CameraSIID.OTA           , OTAPIID.Progress                , 100    ),
             ConstProperty ( CameraSIID.OTA           , OTAPIID.State                   , 'idle' ),
         )
+
+        # read-only: camera_misc.battery_level
+        self.props.register(FuncProperty(
+            siid   = CameraSIID.Misc,
+            piid   = CameraMiscPIID.BatteryLevel,
+            ty     = int,
+            getter = self._props_camera_misc_battery_level
+        ))
+
+    async def _props_camera_misc_battery_level(self) -> int:
+        PacketSerdes.write(
+            wr    = self.mux.writer(MuxType.ComData),
+            key   = self.dev.session_key,
+            frame = Packet(2, PacketCmd.GetBatteryStat, bytes(16)),
+        )
+        return 100
 
     async def run(self):
         while True:
@@ -807,4 +822,5 @@ class MWC11(ConnectionEventListener):
         # start the connection
         conn = Connection(mac, mux, dev, event_listener = self)
         self.cam[mac] = conn
+        self.log.info('New connection from "%s".', mac.hex(':'))
         asyncio.get_running_loop().create_task(conn.run())
