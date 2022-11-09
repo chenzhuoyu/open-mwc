@@ -38,7 +38,7 @@ from miot import RPCRequest
 
 from mwc1x import StaticKey
 from mwc1x import SessionKey
-from mwc1x import DeviceInfo
+from mwc1x import DeviceTag
 from mwc1x import Configuration
 from mwc1x import DeviceConfiguration
 
@@ -123,7 +123,7 @@ class ComSendCmd(IntEnum):  # >= 0x5015
     SetPIRDelayTime         = 0x501e
     GetPIRDelayTime         = 0x501f
     # Unknown1              = 0x5020    # fired when time-sync is successful
-    # Unknown2              = 0x5022    # fired after receiving BatteryStat & Hearbeat (when send_fd is zero)?
+    Heartbeat               = 0x5022
     UpdateMCUModule         = 0x5023
     SetPIRWakeupDSP         = 0x5024
     EnableSpeedTest         = 0x5025
@@ -587,6 +587,10 @@ class CommandTransponder:
         self.waiter[resp] = (tmr, fut)
         return fut
 
+    def post(self, cmd: PacketCmd, *, data: bytes = b''):
+        req = Packet(REQ_VER, cmd, self.token.tx, data)
+        PacketSerdes.write(self.mux.writer(MuxType.ComData), req, key = self.key)
+
     def send(self, req: PacketCmd, resp: PacketCmd, *, data: bytes = b'', timeout: float = 1.0) -> Future[Packet]:
         if resp in self.waiter:
             raise RuntimeError('multiple waits on the same command: ' + str(resp))
@@ -606,20 +610,31 @@ class CommandTransponder:
         tmr.cancel()
         return True
 
-class ConnectionEventListener:
-    def on_disconnected(self, conn: 'Connection'):
-        raise NotImplementedError('on_disconnected()', conn)
+class DeviceStats:
+    rssi      : Optional[int]
+    bat_volt  : Optional[int]
+    bat_level : Optional[int]
+
+    def __init__(self):
+        self.rssi      = None
+        self.bat_volt  = None
+        self.bat_level = None
 
 class Connection:
     mac            : bytes
     log            : Logger
     mux            : MuxConnection
     dev            : DeviceConfiguration
-    cmds           : CommandTransponder
+    port           : CommandTransponder
     props          : Properties
     demux          : FrameDemux
+    stats          : DeviceStats
     tokens         : SessionTokens
-    event_listener : Optional[ConnectionEventListener]
+    event_listener : Optional['EventListener']
+
+    class EventListener:
+        def on_configuration_changed(self):
+            raise NotImplementedError('on_configuration_changed()')
 
     def __init__(self,
         mac            : bytes,
@@ -627,14 +642,15 @@ class Connection:
         dev            : DeviceConfiguration,
         tokens         : SessionTokens,
         *,
-        event_listener : Optional[ConnectionEventListener] = None,
+        event_listener : Optional[EventListener] = None,
     ):
         self.mac            = mac
         self.mux            = mux
         self.dev            = dev
         self.log            = logging.getLogger('mwc11.conn.' + mac.hex('-'))
-        self.cmds           = CommandTransponder(dev.session_key, mux, tokens)
+        self.port           = CommandTransponder(dev.session_key, mux, tokens)
         self.demux          = FrameDemux()
+        self.stats          = DeviceStats()
         self.tokens         = tokens
         self.event_listener = event_listener
 
@@ -666,7 +682,7 @@ class Connection:
             siid   = CameraSIID.Misc,
             piid   = CameraMiscPIID.RSSI,
             ty     = int,
-            getter = self._props_camera_misc_rssi
+            getter = self._prop_camera_misc_rssi,
         ))
 
         # read-only: camera_misc.battery_level
@@ -674,28 +690,54 @@ class Connection:
             siid   = CameraSIID.Misc,
             piid   = CameraMiscPIID.BatteryLevel,
             ty     = int,
-            getter = self._props_camera_misc_battery_level,
+            getter = self._prop_camera_misc_battery_level,
         ))
 
-    async def _props_camera_misc_rssi(self) -> int:
+    def _do_heartbeat(self, p: Packet):
+        data = memoryview(p.data)
+        level, rssi, volt = struct.unpack('I4xi2xH', data[:16])
+
+        # update statistics
+        self.stats.rssi = rssi
+        self.stats.bat_volt = volt
+        self.stats.bat_level = level
+
+        # log the statistics
+        self.log.info('Updated: camera_misc.rssi = %d', rssi)
+        self.log.info('Updated: camera_misc.battery.level = %d%%', level)
+        self.log.info('Updated: camera_misc.battery.voltage = %.3fV', volt / 1000.0)
+
+    def _fire_configuration_changed(self):
+        if self.event_listener:
+            self.event_listener.on_configuration_changed()
+
+    async def _prop_camera_misc_rssi(self) -> int:
+        if self.stats.rssi is None: await self._fetch_rssi()
+        if self.stats.rssi is None: return 0
+        return self.stats.rssi
+
+    async def _prop_camera_misc_battery_level(self) -> int:
+        if self.stats.bat_level is None: await self._fetch_battery_stats()
+        if self.stats.bat_level is None: return -1
+        return self.stats.bat_level
+
+    async def _fetch_rssi(self) -> int:
         try:
-            resp = await self.cmds.send(PacketCmd.GetWiFiSignal, PacketCmd.WiFiSignal)
+            resp = await self.port.send(PacketCmd.GetWiFiSignal, PacketCmd.WiFiSignal)
         except TimeoutError:
             self.log.error('Timeout when fetching RSSI.')
-            return 0
         else:
             try:
                 rssi, = struct.unpack('i', resp.data)
             except ValueError:
                 self.log.error('Cannot parse RSSI. resp = %s', resp)
-                return 0
             else:
-                self.log.debug('CameraMisc.RSSI = %d', rssi)
-                return rssi
+                self.log.info('Fetched: camera_misc.rssi = %d', rssi)
+                self.stats.rssi = rssi
 
-    async def _props_camera_misc_battery_level(self) -> int:
+    async def _fetch_battery_stats(self) -> tuple[int, int]:
         try:
-            resp = await self.cmds.send(PacketCmd.GetBatteryStat, PacketCmd.BatteryStat)
+            resp = await self.port.send(PacketCmd.GetBatteryStat, PacketCmd.BatteryStat)
         except TimeoutError:
             self.log.error('Timeout when fetching battery stats.')
             return 100
@@ -706,17 +748,19 @@ class Connection:
                 self.log.error('Cannot parse battery stats. resp = %s', resp)
                 return 100
             else:
-                self.log.debug('CameraMisc.Battery.{Level = %d%%, Voltage = %.3fV}', level, volt / 1000.0)
-                return level
+                self.log.info('Fetched: camera_misc.battery.level = %d%%', level)
+                self.log.info('Fetched: camera_misc.battery.voltage = %.3fV', volt / 1000.0)
+                self.stats.bat_volt = volt
+                self.stats.bat_level = level
 
-    async def _monitor_port(self):
+    async def _handle_ports(self):
         while True:
             rd = self.mux.reader(MuxType.ComPort)
             port = int.from_bytes(await rd.readexactly(2), 'big')
             self.log.debug('Update COM_SEND port to %d.', port)
             self.tokens.update(port)
 
-    async def _monitor_data(self):
+    async def _handle_requests(self):
         while True:
             rd = self.mux.reader(MuxType.ComData)
             req = await PacketSerdes.read(rd, key = self.dev.session_key)
@@ -727,16 +771,29 @@ class Connection:
                 continue
 
             # attempt to handle the command response
-            if self.cmds.handle_packet(req):
+            if self.port.handle_packet(req):
                 self.log.debug('Received response: %s', req)
+                continue
+
+            # handle heartbeat
+            if req.cmd == PacketCmd.Heartbeat:
+                self._do_heartbeat(req)
+                self.port.post(PacketCmd.Heartbeat)
+                continue
+
+            # handle device ID push
+            if req.cmd == PacketCmd.PushDeviceUID:
+                self.dev.tag = DeviceTag.parse(req.data.rstrip(b'\x00').decode('utf-8'))
+                self.log.debug('Device tag was updated.')
+                self._fire_configuration_changed()
                 continue
 
             print('mwc11', req)
 
     async def run(self):
         await asyncio.wait([
-            asyncio.get_running_loop().create_task(self._monitor_port()),
-            asyncio.get_running_loop().create_task(self._monitor_data()),
+            asyncio.get_running_loop().create_task(self._handle_ports()),
+            asyncio.get_running_loop().create_task(self._handle_requests()),
         ])
 
 class DeviceBinder:
@@ -850,9 +907,9 @@ class DeviceBinder:
         if xkey[:xlen] != rkey:
             raise ValueError('server public key mismatch.')
 
-        # parse the device info
-        desc = desc.rstrip(b'\x00').decode('utf-8')
-        info = DeviceInfo.parse(info.rstrip(b'\x00').decode('utf-8'))
+        # parse the device tag and model
+        mod = desc.rstrip(b'\x00').decode('utf-8')
+        tag = DeviceTag.parse(info.rstrip(b'\x00').decode('utf-8'))
 
         # parse the RPC request
         req = RPCRequest.from_bytes(bytes(buf))
@@ -885,7 +942,7 @@ class DeviceBinder:
 
         # bind successful
         self.log.info('Bind successful.')
-        return DeviceConfiguration(info, desc, akey, StaticKey(skid), ekey)
+        return DeviceConfiguration(tag, mod, akey, StaticKey(skid), ekey)
 
     async def bind(self) -> DeviceConfiguration:
         try:
@@ -893,11 +950,20 @@ class DeviceBinder:
         finally:
             self._drop_key()
 
-class MWC11(ConnectionEventListener):
+class MWC11:
     log: Logger
     rpc: MiotRPC
     cfg: Configuration
     cam: dict[bytes, Connection]
+
+    class EventListener(Connection.EventListener):
+        cfg: Configuration
+
+        def __init__(self, cfg: Configuration) -> None:
+            self.cfg = cfg
+
+        def on_configuration_changed(self):
+            self.cfg.save()
 
     def __init__(self, rpc: MiotRPC, cfg: Configuration):
         self.cam = {}
@@ -907,13 +973,10 @@ class MWC11(ConnectionEventListener):
 
     def find(self, did: str) -> Optional[Connection]:
         for conn in self.cam.values():
-            if conn.dev.info.did == did:
+            if conn.dev.tag.did == did:
                 return conn
         else:
             return None
-
-    def on_disconnected(self, conn: 'Connection'):
-        self.cam.pop(conn.mac, None)
 
     async def serve_forever(self, host: str = STATION_BIND, port: int = STATION_PORT):
         srv = await asyncio.start_server(self._serve_connection, host = host, port = port)
@@ -961,10 +1024,17 @@ class MWC11(ConnectionEventListener):
             mux            = mux,
             dev            = dev,
             tokens         = SessionTokens(dev.session_key, local, remote),
-            event_listener = self,
+            event_listener = self.EventListener(self.cfg),
         )
 
-        # start the connection
+        # register the connection
         self.cam[mac] = conn
         self.log.info('New connection from "%s".', mac.hex(':'))
-        asyncio.get_running_loop().create_task(conn.run())
+
+        # serve the connection
+        try:
+            await conn.run()
+        except Exception:
+            self.log.exception('Error when handling connection from "%s":', mac.hex(':'))
+        finally:
+            self.cam.pop(conn.mac, None)

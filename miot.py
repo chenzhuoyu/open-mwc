@@ -905,45 +905,50 @@ class MiotAppLoader:
 
     @classmethod
     async def main(cls, args: Sequence[str]):
-        d = cls.__arguments__
-        p = argparse.ArgumentParser(description = 'MiIO Client v1.0')
+        log = logging.getLogger('miot.loader')
+        cmd = argparse.ArgumentParser(description = 'MiIO Client v1.0')
 
         # add argumnets
-        for v in d:
-            p.add_argument(*v[:-1], **v[-1])
+        for v in cls.__arguments__:
+            cmd.add_argument(*v[:-1], **v[-1])
 
         # parse the args
-        ns = p.parse_args(args)
-        mod, klass, secp = ns.app, ns.klass, ns.security_provider
+        ns = cmd.parse_args(args)
+        app, klass, secp = ns.app, ns.klass, ns.security_provider
+
+        # print the banner
+        log.info('MiOT Client v1.0')
+        log.info('Loading application %r ...', app)
 
         # load the module
-        spec = importlib.util.spec_from_file_location('miot_app', mod)
-        smod = importlib.util.module_from_spec(spec)
+        tnow = time.monotonic()
+        spec = importlib.util.spec_from_file_location('miot_app', app)
+        inst = importlib.util.module_from_spec(spec)
 
         # insert into modules
-        sys.modules['miot_app'] = smod
-        spec.loader.exec_module(smod)
+        sys.modules['miot_app'] = inst
+        spec.loader.exec_module(inst)
 
         # find the class
         try:
-            app_class = getattr(smod, klass)
+            app_class = getattr(inst, klass)
         except AttributeError:
-            print('* error: class not found: %s:%s' % (mod, klass))
+            log.error('Class not found: %s:%s' % (app, klass))
             sys.exit(1)
 
         # check for subclass
         if not isinstance(app_class, type) or not issubclass(app_class, MiotApplication):
-            print('* error: application must be a subclass of MiotApplication: %s:%s' % (mod, klass))
+            log.error('Application must be a subclass of MiotApplication: %s:%s' % (app, klass))
             sys.exit(1)
 
         # construct the configuration
-        cfg = MiotConfiguration(
-            app_class,
-            cls.__providers__[secp](),
-            *ns.args,
-        )
+        cfg = MiotConfiguration(app_class, cls.__providers__[secp](), *ns.args)
+        log.info('Connecting to MiOT Server ...')
 
         # start the connection
         addr = await cfg.resolve()
         conn = await cfg.connect(*addr)
+
+        # run the application
+        log.info('Application started successfully in %.2fms.', (time.monotonic() - tnow) * 1000.0)
         await conn.run_forever()

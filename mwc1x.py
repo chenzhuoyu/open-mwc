@@ -53,7 +53,7 @@ class SessionKey(bytes):
     def frame_token(self, addr: str, port: int) -> bytes:
         return hashlib.md5(self.encrypt(socket.inet_aton(addr) + port.to_bytes(2, 'little'))).digest()
 
-class DeviceInfo:
+class DeviceTag:
     sn1: str
     sn2: str
     did: str
@@ -92,7 +92,7 @@ class DeviceInfo:
         ])
 
     @classmethod
-    def parse(cls, info: str) -> 'DeviceInfo':
+    def parse(cls, info: str) -> 'DeviceTag':
         try:
             val, did, psk = info.split('|')
             sn1, sn2, oob, mac = val.split(':')
@@ -132,14 +132,14 @@ class ApConfiguration:
         )
 
 class DeviceConfiguration:
-    info        : DeviceInfo
+    tag         : DeviceTag
     model       : str
     auth_key    : bytes
     static_key  : StaticKey
     session_key : SessionKey
 
-    def __init__(self, info: DeviceInfo, model: str, auth_key: bytes, static_key: StaticKey, session_key: SessionKey):
-        self.info        = info
+    def __init__(self, tag: DeviceTag, model: str, auth_key: bytes, static_key: StaticKey, session_key: SessionKey):
+        self.tag         = tag
         self.model       = model
         self.auth_key    = auth_key
         self.static_key  = static_key
@@ -148,7 +148,7 @@ class DeviceConfiguration:
     def __repr__(self) -> str:
         return '\n'.join([
             'DeviceConfiguration {',
-            '    info        = %s' % self.info,
+            '    tag         = %s' % self.tag,
             '    model       = %s' % self.model,
             '    auth_key    = %s' % self.auth_key.hex(),
             '    static_key  = %d' % self.static_key,
@@ -158,7 +158,7 @@ class DeviceConfiguration:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            'info'        : str(self.info),
+            'tag'         : str(self.tag),
             'model'       : self.model,
             'auth_key'    : base64.b64encode(self.auth_key).decode('utf-8'),
             'static_key'  : self.static_key,
@@ -168,7 +168,7 @@ class DeviceConfiguration:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> 'DeviceConfiguration':
         return cls(
-            info        = DeviceInfo.parse(Payload.type_checked(data['info'], str)),
+            tag         = DeviceTag.parse(Payload.type_checked(data['tag'], str)),
             model       = Payload.type_checked(data['model'], str),
             auth_key    = base64.b64decode(Payload.type_checked(data['auth_key'], str)),
             static_key  = StaticKey(Payload.type_checked(data['static_key'], int)),
