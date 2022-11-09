@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import time
+import socket
 import struct
 import asyncio
 import hexdump
@@ -14,7 +15,9 @@ from typing import Iterable
 from typing import Optional
 
 from asyncio import Queue
+from asyncio import Future
 from asyncio import Protocol
+from asyncio import TimerHandle
 from asyncio import StreamReader
 from asyncio import StreamWriter
 from asyncio import WriteTransport
@@ -52,7 +55,8 @@ from props import DetectionMiscPIID
 LOG_FMT         = '%(asctime)s %(name)s [%(levelname)s] %(message)s'
 LOG_LEVEL       = logging.DEBUG
 
-PROTO_VER       = 2
+REQ_VER         = 2
+COM_RX_PORT     = 32295
 STATION_PORT    = 6282
 STATION_BIND    = '0.0.0.0'
 
@@ -327,12 +331,11 @@ class PacketSerdes:
 
         # command and signature
         ext = b''
-        sig = data[16:]
         cmd = PacketCmd(cmd)
 
         # no data
         if size == 0:
-            return Packet(ver, cmd, sig)
+            return Packet(ver, cmd, data[12:])
 
         # special case of the initial key exchange packet
         if cmd == PacketCmd.ExchangeBindInfo:
@@ -341,11 +344,11 @@ class PacketSerdes:
 
         # unencrypted data, just read the body
         if key is None:
-            return Packet(ver, cmd, sig, await rd.readexactly(size))
+            return Packet(ver, cmd, data[12:], await rd.readexactly(size))
 
         # add padding size, read and decrypt the body
         rbuf = await rd.readexactly((((size - 1) >> 4) + 1) << 4)
-        return Packet(ver, cmd, sig, ext + key.decrypt(rbuf, size))
+        return Packet(ver, cmd, data[12:], ext + key.decrypt(rbuf, size))
 
     @staticmethod
     def write(wr: StreamWriter, frame: Packet, *, key: Optional[SessionKey] = None):
@@ -411,10 +414,11 @@ class FrameDemux:
 
 class MuxType(IntEnum):
     StaInit = 0
-    UdpData = 1
-    ComData = 2
-    DspComm = 3
-    UdpComm = 4
+    ComPort = 1
+    UdpData = 2
+    ComData = 3
+    DspComm = 4
+    UdpComm = 5
 
 class MuxFrame:
     ty  : MuxType
@@ -544,6 +548,64 @@ class MuxConnection:
                         self.log.debug('Received a packet with type %s.', req.ty.name)
                         self.mux[req.ty][0].feed_data(req.buf)
 
+class SessionTokens:
+    tx   : bytes
+    rx   : bytes
+    key  : SessionKey
+    addr : str
+
+    def __init__(self, key: SessionKey, local: str, remote: str):
+        self.tx   = b''
+        self.rx   = key.frame_token(remote, COM_RX_PORT)
+        self.key  = key
+        self.addr = local
+
+    def update(self, port: int):
+        self.tx = self.key.frame_token(self.addr, port)
+
+class CommandTransponder:
+    key    : SessionKey
+    mux    : MuxConnection
+    token  : SessionTokens
+    waiter : dict[PacketCmd, tuple[TimerHandle, Future[Packet]]]
+
+    def __init__(self, key: SessionKey, mux: MuxConnection, token: SessionTokens):
+        self.key    = key
+        self.mux    = mux
+        self.token  = token
+        self.waiter = {}
+
+    def _fire_timeout(self, cmd: PacketCmd):
+        if cmd in self.waiter:
+            _, fut = self.waiter.pop(cmd)
+            fut.set_exception(TimeoutError)
+
+    def _send_request(self, req: Packet, resp: PacketCmd, timeout: float) -> Future[Packet]:
+        fut = asyncio.get_running_loop().create_future()
+        tmr = asyncio.get_running_loop().call_later(timeout, self._fire_timeout, resp)
+        PacketSerdes.write(self.mux.writer(MuxType.ComData), req, key = self.key)
+        self.waiter[resp] = (tmr, fut)
+        return fut
+
+    def send(self, req: PacketCmd, resp: PacketCmd, *, data: bytes = b'', timeout: float = 1.0) -> Future[Packet]:
+        if resp in self.waiter:
+            raise RuntimeError('multiple waits on the same command: ' + str(resp))
+        else:
+            return self._send_request(Packet(REQ_VER, req, self.token.tx, data), resp, timeout)
+
+    def handle_packet(self, p: Packet) -> bool:
+        cmd = p.cmd
+        tmr, fut = self.waiter.pop(cmd, (None, None))
+
+        # check if it is the expected packet
+        if tmr is None:
+            return False
+
+        # stop the timer, and resolve the future
+        fut.set_result(p)
+        tmr.cancel()
+        return True
+
 class ConnectionEventListener:
     def on_disconnected(self, conn: 'Connection'):
         raise NotImplementedError('on_disconnected()', conn)
@@ -553,14 +615,17 @@ class Connection:
     log            : Logger
     mux            : MuxConnection
     dev            : DeviceConfiguration
+    cmds           : CommandTransponder
     props          : Properties
     demux          : FrameDemux
+    tokens         : SessionTokens
     event_listener : Optional[ConnectionEventListener]
 
     def __init__(self,
         mac            : bytes,
         mux            : MuxConnection,
         dev            : DeviceConfiguration,
+        tokens         : SessionTokens,
         *,
         event_listener : Optional[ConnectionEventListener] = None,
     ):
@@ -568,7 +633,9 @@ class Connection:
         self.mux            = mux
         self.dev            = dev
         self.log            = logging.getLogger('mwc11.conn.' + mac.hex('-'))
+        self.cmds           = CommandTransponder(dev.session_key, mux, tokens)
         self.demux          = FrameDemux()
+        self.tokens         = tokens
         self.event_listener = event_listener
 
         # initialize all const properties
@@ -582,7 +649,6 @@ class Connection:
             ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.LiveStream       , 0      ),
             ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.Distortion       , True   ),
             ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.Resolution       , 0      ),
-            ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.RSSI             , -100   ),
             ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.Online           , False  ),
             ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.PowerFreq        , 50     ),
             ConstProperty ( CameraSIID.DetectionMisc , DetectionMiscPIID.RecordFreq    , 0      ),
@@ -595,27 +661,83 @@ class Connection:
             ConstProperty ( CameraSIID.OTA           , OTAPIID.State                   , 'idle' ),
         )
 
+        # read-only: camera_misc.rssi
+        self.props.register(FuncProperty(
+            siid   = CameraSIID.Misc,
+            piid   = CameraMiscPIID.RSSI,
+            ty     = int,
+            getter = self._props_camera_misc_rssi
+        ))
+
         # read-only: camera_misc.battery_level
         self.props.register(FuncProperty(
             siid   = CameraSIID.Misc,
             piid   = CameraMiscPIID.BatteryLevel,
             ty     = int,
-            getter = self._props_camera_misc_battery_level
+            getter = self._props_camera_misc_battery_level,
         ))
 
-    async def _props_camera_misc_battery_level(self) -> int:
-        PacketSerdes.write(
-            wr    = self.mux.writer(MuxType.ComData),
-            key   = self.dev.session_key,
-            frame = Packet(2, PacketCmd.GetBatteryStat, bytes(16)),
-        )
-        return 100
+    async def _props_camera_misc_rssi(self) -> int:
+        try:
+            resp = await self.cmds.send(PacketCmd.GetWiFiSignal, PacketCmd.WiFiSignal)
+        except TimeoutError:
+            self.log.error('Timeout when fetching RSSI.')
+            return 0
+        else:
+            try:
+                rssi, = struct.unpack('i', resp.data)
+            except ValueError:
+                self.log.error('Cannot parse RSSI. resp = %s', resp)
+                return 0
+            else:
+                self.log.debug('CameraMisc.RSSI = %d', rssi)
+                return rssi
 
-    async def run(self):
+    async def _props_camera_misc_battery_level(self) -> int:
+        try:
+            resp = await self.cmds.send(PacketCmd.GetBatteryStat, PacketCmd.BatteryStat)
+        except TimeoutError:
+            self.log.error('Timeout when fetching battery stats.')
+            return 100
+        else:
+            try:
+                level, volt = struct.unpack('II', resp.data)
+            except ValueError:
+                self.log.error('Cannot parse battery stats. resp = %s', resp)
+                return 100
+            else:
+                self.log.debug('CameraMisc.Battery.{Level = %d%%, Voltage = %.3fV}', level, volt / 1000.0)
+                return level
+
+    async def _monitor_port(self):
+        while True:
+            rd = self.mux.reader(MuxType.ComPort)
+            port = int.from_bytes(await rd.readexactly(2), 'big')
+            self.log.debug('Update COM_SEND port to %d.', port)
+            self.tokens.update(port)
+
+    async def _monitor_data(self):
         while True:
             rd = self.mux.reader(MuxType.ComData)
             req = await PacketSerdes.read(rd, key = self.dev.session_key)
+
+            # verify token
+            if req.token != self.tokens.rx:
+                self.log.warning('Cannot verify token, dropped. packet = %s', req)
+                continue
+
+            # attempt to handle the command response
+            if self.cmds.handle_packet(req):
+                self.log.debug('Received response: %s', req)
+                continue
+
             print('mwc11', req)
+
+    async def run(self):
+        await asyncio.wait([
+            asyncio.get_running_loop().create_task(self._monitor_port()),
+            asyncio.get_running_loop().create_task(self._monitor_data()),
+        ])
 
 class DeviceBinder:
     mac: bytes
@@ -794,22 +916,32 @@ class MWC11(ConnectionEventListener):
         self.cam.pop(conn.mac, None)
 
     async def serve_forever(self, host: str = STATION_BIND, port: int = STATION_PORT):
-        srv = await asyncio.start_server(self._handle_connection, host = host, port = port)
+        srv = await asyncio.start_server(self._serve_connection, host = host, port = port)
         await srv.serve_forever()
+
+    async def _serve_connection(self, rd: StreamReader, wr: StreamWriter):
+        try:
+            await self._handle_connection(rd, wr)
+        except Exception:
+            self.log.exception('Exception when handling connection:')
 
     async def _handle_connection(self, rd: StreamReader, wr: StreamWriter):
         mux = MuxConnection(rd, wr)
         asyncio.get_running_loop().create_task(mux.run())
 
-        # read the MAC address, and find the session key
-        mac = await mux.reader(MuxType.StaInit).readexactly(6)
-        dev = self.cfg.devices.get(mac)
+        # read the MAC address, local address and remote address
+        buf = await mux.reader(MuxType.StaInit).readexactly(14)
+        mac, local, remote = struct.unpack('>6s4s4s', buf)
+
+        # find the session key
+        cfg = self.cfg
+        dev = cfg.devices.get(mac)
 
         # bind the device if needed
         if dev is None:
             try:
-                dev = await DeviceBinder(mac, self.rpc, mux, self.cfg).bind()
-                self.cfg.add_device(mac, dev)
+                dev = await DeviceBinder(mac, self.rpc, mux, cfg).bind()
+                cfg.add_device(mac, dev)
             except ValueError as e:
                 mux.close()
                 self.log.error('Cannot register device "%s": %s', mac.hex(':'), e)
@@ -819,8 +951,20 @@ class MWC11(ConnectionEventListener):
                 self.log.error('Cannot register device "%s": timeout.', mac.hex(':'))
                 return
 
+        # parse the addresses
+        local = socket.inet_ntop(socket.AF_INET, local)
+        remote = socket.inet_ntop(socket.AF_INET, remote)
+
+        # create a new connection
+        conn = Connection(
+            mac            = mac,
+            mux            = mux,
+            dev            = dev,
+            tokens         = SessionTokens(dev.session_key, local, remote),
+            event_listener = self,
+        )
+
         # start the connection
-        conn = Connection(mac, mux, dev, event_listener = self)
         self.cam[mac] = conn
         self.log.info('New connection from "%s".', mac.hex(':'))
         asyncio.get_running_loop().create_task(conn.run())

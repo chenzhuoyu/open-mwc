@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fmt::Display,
     io::{Error as IoError, ErrorKind},
-    net::{SocketAddr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
 };
 
 use bytes::BytesMut;
@@ -10,6 +10,7 @@ use clap::Parser;
 use futures::{stream::FuturesUnordered, Future, StreamExt};
 use mwc11mux::{
     arp::{self, MACAddress},
+    as_err,
     log::ConsoleLogger,
     options::Options,
     tcp_accept_v4, tcp_read_buf, udp_recv_v4, FromPort, Maybe, Unit,
@@ -59,10 +60,11 @@ enum MuxEvent {
 #[derive(Debug)]
 enum PacketType {
     StaInit = 0,
-    UdpData = 1,
-    ComData = 2,
-    DspComm = 3,
-    UdpComm = 4,
+    ComPort = 1,
+    UdpData = 2,
+    ComData = 3,
+    DspComm = 4,
+    UdpComm = 5,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -71,19 +73,26 @@ impl TryFrom<u8> for PacketType {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::StaInit),
-            1 => Ok(Self::UdpData),
-            2 => Ok(Self::ComData),
-            3 => Ok(Self::DspComm),
-            4 => Ok(Self::UdpComm),
+            1 => Ok(Self::ComPort),
+            2 => Ok(Self::UdpData),
+            3 => Ok(Self::ComData),
+            4 => Ok(Self::DspComm),
+            5 => Ok(Self::UdpComm),
             _ => Err(IoError::from(ErrorKind::InvalidInput)),
         }
     }
+}
+
+struct AddressPair {
+    local: Ipv4Addr,
+    remote: Ipv4Addr,
 }
 
 struct Connection {
     buf: BytesMut,
     sta: TcpStream,
     mac: MACAddress,
+    addr: AddressPair,
     com_chan: BytesMut,
     com_send: Option<TcpStream>,
     com_recv: Option<TcpStream>,
@@ -101,22 +110,102 @@ impl Connection {
         let buf = BytesMut::with_capacity(65536);
         let mut sta = TcpStream::connect(sta).await?;
 
+        /* get the local and remote addresses */
+        let addr = match (&send, &recv) {
+            (Some(cc), None) | (None, Some(cc)) => {
+                match (cc.peer_addr()?.ip(), cc.local_addr()?.ip()) {
+                    (IpAddr::V4(r), IpAddr::V4(v)) => AddressPair {
+                        local: v,
+                        remote: r,
+                    },
+                    (IpAddr::V6(v), _) | (_, IpAddr::V6(v)) => {
+                        return Err(as_err(IoError::new(
+                            ErrorKind::Unsupported,
+                            format!("IPv6 address {} is not supported", &v),
+                        )))
+                    }
+                }
+            }
+            (Some(c1), Some(c2)) => match (
+                c1.peer_addr()?.ip(),
+                c2.peer_addr()?.ip(),
+                c1.local_addr()?.ip(),
+                c2.local_addr()?.ip(),
+            ) {
+                (IpAddr::V4(r1), IpAddr::V4(r2), IpAddr::V4(v1), IpAddr::V4(v2))
+                    if v1 == v2 && r1 == r2 =>
+                {
+                    AddressPair {
+                        local: v1,
+                        remote: r1,
+                    }
+                }
+                (IpAddr::V4(r1), IpAddr::V4(r2), IpAddr::V4(v1), IpAddr::V4(v2)) => {
+                    return Err(as_err(IoError::new(
+                        ErrorKind::PermissionDenied,
+                        format!(
+                            "MAC address confliction: {} and {}",
+                            if v1 == v2 { &r1 } else { &v1 },
+                            if v1 == v2 { &r2 } else { &v2 },
+                        ),
+                    )))
+                }
+                (IpAddr::V6(v), _, _, _)
+                | (_, IpAddr::V6(v), _, _)
+                | (_, _, IpAddr::V6(v), _)
+                | (_, _, _, IpAddr::V6(v)) => {
+                    return Err(as_err(IoError::new(
+                        ErrorKind::Unsupported,
+                        format!("IPv6 address {} is not supported", &v),
+                    )))
+                }
+            },
+            (None, None) => {
+                return Err(as_err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    "either Tx or Rx channel must be present",
+                )))
+            }
+        };
+
+        /* get the length of both parts */
+        let n1 = mac.bytes().len() as u32;
+        let n2 = addr.local.octets().len() as u32;
+        let n3 = addr.remote.octets().len() as u32;
+
         /* send the initialization packet */
         sta.write_u8(PacketType::StaInit as u8).await?;
-        sta.write_u32(mac.bytes().len() as u32).await?;
+        sta.write_u32(n1 + n2 + n3).await?;
         sta.write_all(&mac.bytes()).await?;
+        sta.write_all(&addr.local.octets()).await?;
+        sta.write_all(&addr.remote.octets()).await?;
+
+        /* set the COM_SEND port if any */
+        if let Some(cc) = send.as_ref() {
+            Self::update_tx_port(&mut sta, cc.peer_addr()?.port()).await?;
+        }
 
         /* construct the new connection */
         Ok(Self {
             buf,
             sta,
             mac,
+            addr,
             com_chan: BytesMut::with_capacity(65536),
             com_send: send,
             com_recv: recv,
             dsp_comm: None,
             udp_comm: None,
         })
+    }
+}
+
+impl Connection {
+    async fn update_tx_port(sta: &mut TcpStream, port: u16) -> Unit {
+        sta.write_u8(PacketType::ComPort as u8).await?;
+        sta.write_u32(2).await?;
+        sta.write_u16(port).await?;
+        Ok(())
     }
 }
 
@@ -148,6 +237,10 @@ impl Connection {
         match tag {
             PacketType::StaInit => {
                 log::warn!("Unexpected STA_INIT packet, dropped.");
+                Ok(())
+            }
+            PacketType::ComPort => {
+                log::warn!("Unexpected COM_PEER packet, dropped.");
                 Ok(())
             }
             PacketType::UdpData => {
@@ -209,9 +302,77 @@ impl Connection {
 
 impl Connection {
     async fn update_com_send(&mut self, mut conn: TcpStream) -> Unit {
-        conn.write_all_buf(&mut self.com_chan).await?;
-        self.com_send = Some(conn);
-        Ok(())
+        match (conn.peer_addr()?, conn.local_addr()?) {
+            (SocketAddr::V4(r), SocketAddr::V4(v))
+                if *v.ip() == self.addr.local && *r.ip() == self.addr.remote =>
+            {
+                conn.write_all_buf(&mut self.com_chan).await?;
+                Self::update_tx_port(&mut self.sta, r.port()).await?;
+                self.com_send = Some(conn);
+                Ok(())
+            }
+            (SocketAddr::V4(r), SocketAddr::V4(v)) => Err(as_err(IoError::new(
+                ErrorKind::PermissionDenied,
+                format!("MAC address confliction: {} and {}", r.ip(), v.ip()),
+            ))),
+            (SocketAddr::V6(v), _) | (_, SocketAddr::V6(v)) => Err(as_err(IoError::new(
+                ErrorKind::Unsupported,
+                format!("IPv6 address {} is not supported", v.ip()),
+            ))),
+        }
+    }
+}
+
+impl Connection {
+    fn update_com_recv(&mut self, conn: TcpStream) -> Unit {
+        match (conn.peer_addr()?.ip(), conn.local_addr()?.ip()) {
+            (IpAddr::V4(r), IpAddr::V4(v)) if v == self.addr.local && r == self.addr.remote => {
+                self.com_recv = Some(conn);
+                Ok(())
+            }
+            (IpAddr::V4(r), IpAddr::V4(v)) => Err(as_err(IoError::new(
+                ErrorKind::PermissionDenied,
+                format!("MAC address confliction: {} and {}", &r, &v),
+            ))),
+            (IpAddr::V6(v), _) | (_, IpAddr::V6(v)) => Err(as_err(IoError::new(
+                ErrorKind::Unsupported,
+                format!("IPv6 address {} is not supported", &v),
+            ))),
+        }
+    }
+
+    fn update_dsp_comm(&mut self, conn: TcpStream) -> Unit {
+        match (conn.peer_addr()?.ip(), conn.local_addr()?.ip()) {
+            (IpAddr::V4(r), IpAddr::V4(v)) if v == self.addr.local && r == self.addr.remote => {
+                self.dsp_comm = Some(conn);
+                Ok(())
+            }
+            (IpAddr::V4(r), IpAddr::V4(v)) => Err(as_err(IoError::new(
+                ErrorKind::PermissionDenied,
+                format!("MAC address confliction: {} and {}", &r, &v),
+            ))),
+            (IpAddr::V6(v), _) | (_, IpAddr::V6(v)) => Err(as_err(IoError::new(
+                ErrorKind::Unsupported,
+                format!("IPv6 address {} is not supported", &v),
+            ))),
+        }
+    }
+
+    fn update_udp_comm(&mut self, conn: TcpStream) -> Unit {
+        match (conn.peer_addr()?.ip(), conn.local_addr()?.ip()) {
+            (IpAddr::V4(r), IpAddr::V4(v)) if v == self.addr.local && r == self.addr.remote => {
+                self.udp_comm = Some(conn);
+                Ok(())
+            }
+            (IpAddr::V4(r), IpAddr::V4(v)) => Err(as_err(IoError::new(
+                ErrorKind::PermissionDenied,
+                format!("MAC address confliction: {} and {}", &r, &v),
+            ))),
+            (IpAddr::V6(v), _) | (_, IpAddr::V6(v)) => Err(as_err(IoError::new(
+                ErrorKind::Unsupported,
+                format!("IPv6 address {} is not supported", &v),
+            ))),
+        }
     }
 }
 
@@ -515,7 +676,7 @@ impl ConnectionMux {
 
     async fn accept_com_recv(&mut self, mac: MACAddress, conn: TcpStream) -> Unit {
         if let Some(ctx) = self.conn.get_mut(&mac) {
-            ctx.com_recv = Some(conn);
+            ctx.update_com_recv(conn)?;
             log::info!("Updated COM_RECV channel for {}.", &mac);
             Ok(())
         } else {
@@ -535,7 +696,7 @@ impl ConnectionMux {
 
     async fn accept_dsp_comm(&mut self, mac: MACAddress, conn: TcpStream) -> Unit {
         if let Some(ctx) = self.conn.get_mut(&mac) {
-            ctx.dsp_comm = Some(conn);
+            ctx.update_dsp_comm(conn)?;
             log::info!("Updated DSP_COMM channel for {}.", &mac);
             Ok(())
         } else {
@@ -546,7 +707,7 @@ impl ConnectionMux {
 
     async fn accept_udp_comm(&mut self, mac: MACAddress, conn: TcpStream) -> Unit {
         if let Some(ctx) = self.conn.get_mut(&mac) {
-            ctx.udp_comm = Some(conn);
+            ctx.update_udp_comm(conn)?;
             log::info!("Updated UDP_COMM channel for {}.", &mac);
             Ok(())
         } else {

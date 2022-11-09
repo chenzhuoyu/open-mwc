@@ -44,6 +44,9 @@ from mwc11 import STATION_PORT
 from mwc1x import Configuration
 from mwc1x import ConfigurationFile
 
+from props import SIID
+from props import PIID
+from props import Property
 from props import Properties
 from props import ConstProperty
 
@@ -253,6 +256,22 @@ class MiotApp(MiotApplication):
         rets = []
         null = object()
 
+        # property getter
+        async def read_prop(did: str, prop: Property) -> tuple[str, SIID, PIID, int, Any]:
+            try:
+                data = await prop.read()
+            except (ValueError, PermissionError) as e:
+                self.log.warning('Cannot read property %s.%d.%d: %s', did, prop.siid, prop.piid, e)
+                return did, prop.siid, prop.piid, RPCError.Code.NoSuchProperty, null
+            else:
+                self.log.info('Get property %s.%s: %r', did, prop.name, data)
+                return did, prop.siid, prop.piid, 0, data
+
+        # property errors
+        async def error_prop(did: str, siid: SIID, piid: PIID) -> tuple[str, SIID, PIID, int, Any]:
+            self.log.warning('Cannot read property %s.%d.%d: device not found', did, siid, piid)
+            return did, siid, piid, RPCError.Code.NoSuchProperty, null
+
         # fetch every property
         for item in p.args:
             try:
@@ -264,27 +283,20 @@ class MiotApp(MiotApplication):
                 raise RPCError(-1, 'invalid request') from None
 
             # find the device
-            cam = self.cam
-            dev = cam.find(did)
+            devid = str(self.did)
+            subdev = self.cam.find(did)
 
             # read the properties
-            try:
-                if dev is not None:
-                    prop = dev.props[siid, piid]
-                    data = await prop.read()
-                    rets.append((did, siid, piid, 0, data))
-                    self.log.info('Get device property %s.%s: %r', did, prop.name, data)
-                elif did == str(self.did):
-                    prop = self.props[siid, piid]
-                    data = await prop.read()
-                    rets.append((did, siid, piid, 0, data))
-                    self.log.info('Get station property %s: %r', prop.name, data)
-                else:
-                    rets.append((did, siid, piid, RPCError.Code.NoSuchProperty, null))
-                    self.log.warning('Cannot read property %s.%d.%d: device not found', did, siid, piid)
-            except (ValueError, PermissionError) as e:
-                rets.append((did, siid, piid, RPCError.Code.NoSuchProperty, null))
-                self.log.warning('Cannot read property %s.%d.%d: %s', did, siid, piid, e)
+            if did == devid:
+                rets.append(read_prop(did, self.props[siid, piid]))
+            elif subdev is not None:
+                rets.append(read_prop(did, subdev.props[siid, piid]))
+            else:
+                rets.append(error_prop(did, siid, piid))
+
+        # wait for the result
+        r, _ = await asyncio.wait(rets)
+        rets = [ts.result() for ts in r]
 
         # construct the response
         return [
@@ -306,6 +318,22 @@ class MiotApp(MiotApplication):
         rets = []
         args = p.args
 
+        # property setter
+        async def write_prop(did: str, prop: Property, value: Any) -> tuple[str, SIID, PIID, int]:
+            try:
+                await prop.write(value)
+            except (ValueError, PermissionError) as e:
+                self.log.warning('Cannot write %r to property %s.%d.%d: %s', value, did, prop.siid, prop.piid, e)
+                return did, prop.siid, prop.piid, RPCError.Code.NoSuchProperty
+            else:
+                self.log.info('Set property %s.%s to %r', did, prop.name, value)
+                return did, prop.siid, prop.piid, 0
+
+        # property errors
+        async def error_prop(did: str, siid: SIID, piid: PIID, value: Any) -> tuple[str, SIID, PIID, int]:
+            self.log.warning('Cannot write %r to property %s.%d.%d: device not found', value, did, siid, piid)
+            return did, siid, piid, RPCError.Code.NoSuchProperty
+
         # fetch every property
         for item in args:
             try:
@@ -318,27 +346,20 @@ class MiotApp(MiotApplication):
                 raise RPCError(-1, 'invalid request') from None
 
             # find the device
-            cam = self.cam
-            dev = cam.find(did)
+            devid = str(self.did)
+            subdev = self.cam.find(did)
 
-            # read the properties
-            try:
-                if dev is not None:
-                    prop = dev.props[siid, piid]
-                    self.log.info('Set device property %s.%s to %r', did, prop.name, value)
-                    await prop.write(value)
-                    rets.append((did, siid, piid, 0))
-                elif did == str(self.did):
-                    prop = self.props[siid, piid]
-                    self.log.info('Set station property %s to %r', prop.name, value)
-                    await prop.write(value)
-                    rets.append((did, siid, piid, 0))
-                else:
-                    rets.append((did, siid, piid, RPCError.Code.NoSuchProperty))
-                    self.log.warning('Cannot write %r to property %s.%d.%d: device not found', value, did, siid, piid)
-            except (ValueError, PermissionError) as e:
-                rets.append((did, siid, piid, RPCError.Code.NoSuchProperty))
-                self.log.warning('Cannot write %r to property %s.%d.%d: %s', value, did, siid, piid, e)
+            # write the properties
+            if did == devid:
+                rets.append(write_prop(did, self.props[siid, piid], value))
+            elif subdev is not None:
+                rets.append(write_prop(did, subdev.props[siid, piid], value))
+            else:
+                rets.append(error_prop(did, siid, piid, value))
+
+        # wait for the result
+        r, _ = await asyncio.wait(rets)
+        rets = [ts.result() for ts in r]
 
         # construct the response
         return [
