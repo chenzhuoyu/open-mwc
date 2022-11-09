@@ -55,6 +55,7 @@ class CameraMiscPIID(IntEnum):
     RSSI                = 6     # i16   = -100
     Online              = 7     # bool  = False
     PowerFreq           = 8     # u8    = 50
+    BatteryVoltage      = -1    # virtual PIID
 
 class DetectionMiscPIID(IntEnum):
     RecordFreq          = 1     # u16   = 0

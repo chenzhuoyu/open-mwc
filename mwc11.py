@@ -11,6 +11,8 @@ import logging
 from enum import IntEnum
 from logging import Logger
 
+from typing import Any
+from typing import Callable
 from typing import Iterable
 from typing import Optional
 
@@ -42,9 +44,13 @@ from mwc1x import DeviceTag
 from mwc1x import Configuration
 from mwc1x import DeviceConfiguration
 
-from props import FuncProperty, Properties
+from props import Property
+from props import Properties
+from props import FuncProperty
 from props import ConstProperty
 
+from props import SIID
+from props import PIID
 from props import OTAPIID
 from props import CameraSIID
 from props import DetectionPIID
@@ -563,7 +569,7 @@ class SessionTokens:
     def update(self, port: int):
         self.tx = self.key.frame_token(self.addr, port)
 
-class CommandTransponder:
+class CommandTransport:
     key    : SessionKey
     mux    : MuxConnection
     token  : SessionTokens
@@ -610,25 +616,115 @@ class CommandTransponder:
         tmr.cancel()
         return True
 
-class DeviceStats:
-    rssi      : Optional[int]
-    bat_volt  : Optional[int]
-    bat_level : Optional[int]
+class PropertyRepository:
+    log  : Logger
+    repo : dict[str, Any]
+    port : CommandTransport
 
-    def __init__(self):
-        self.rssi      = None
-        self.bat_volt  = None
-        self.bat_level = None
+    class PropertySource(Property):
+        repo: 'PropertyRepository'
+
+        def __init__(self, siid: SIID, piid: PIID, ty: type, repo: 'PropertyRepository'):
+            self.repo = repo
+            super().__init__(siid, piid, ty)
+
+        async def _do_read(self) -> Any:
+            return await self.repo.value(self.siid, self.piid)
+
+        async def _do_write(self, value: Any):
+            self.repo.update(self.siid, self.piid, value)
+
+    def __init__(self, port: CommandTransport):
+        self.log  = logging.getLogger('mwc11.repo')
+        self.repo = {}
+        self.port = port
+
+    __properties__ = {
+        (CameraSIID.Misc, CameraMiscPIID.RSSI): (
+            ('RSSI', 'camera_misc.rssi', 0),
+            PacketCmd.GetWiFiSignal,
+            PacketCmd.WiFiSignal,
+            ('i', 'camera_misc.rssi')
+        ),
+        (CameraSIID.Misc, CameraMiscPIID.BatteryLevel): (
+            ('battery stats', 'camera_misc.battery.level', -1),
+            PacketCmd.GetBatteryStat,
+            PacketCmd.BatteryStat,
+            ('I', 'camera_misc.battery.level'),
+            ('I', 'camera_misc.battery.voltage'),
+        ),
+        (CameraSIID.Misc, CameraMiscPIID.BatteryVoltage): (
+            ('battery stats', 'camera_misc.battery.voltage', -1),
+            PacketCmd.GetBatteryStat,
+            PacketCmd.BatteryStat,
+            ('I', 'camera_misc.battery.level'),
+            ('I', 'camera_misc.battery.voltage'),
+        ),
+    }
+
+    async def value(self, siid: SIID, piid: PIID) -> Any:
+        buf = self.__properties__
+        (what, name, defv), req, resp, *fmt = buf[siid, piid]
+
+        # use the cached value if any
+        if name in self.repo:
+            return self.repo[name]
+
+        # fetch the value
+        try:
+            ret = await self.port.send(req, resp)
+        except TimeoutError:
+            self.log.error('Timeout when fetching %s.', what)
+            return defv
+
+        # parse the result
+        try:
+            vals = struct.unpack(''.join(f for f, _ in fmt), ret.data)
+        except ValueError:
+            self.log.error('Cannot parse %s. resp = %s', what, ret)
+            return defv
+
+        # update to cache
+        for (_, key), value in zip(fmt, vals):
+            self.log.info('Fetched: %s = %s', key, value)
+            self.repo[key] = value
+
+        # use the default value if still not present
+        if name not in self.repo:
+            return defv
+        else:
+            return self.repo[name]
+
+    def update(self, siid: SIID, piid: PIID, value: Any):
+        buf = self.__properties__
+        (_, name, defv), _, _, *_ = buf[siid, piid]
+
+        # check the type
+        if type(value) != type(defv):
+            raise TypeError('Type mismatch for field ' + name)
+
+        # log and update the value
+        self.log.info('Updated: %s = %s', name, value)
+        self.repo[name] = value
+
+    def __getitem__(self, key: tuple[SIID, PIID]) -> PropertySource:
+        siid, piid = key
+        (_, _, defv), _, _, *_ = self.__properties__[key]
+        return self.PropertySource(siid, piid, type(defv), self)
+
+    def __setitem__(self, key: tuple[SIID, PIID], value: Any):
+        siid, piid = key
+        self.update(siid, piid, value)
 
 class Connection:
     mac            : bytes
     log            : Logger
     mux            : MuxConnection
     dev            : DeviceConfiguration
-    port           : CommandTransponder
+    port           : CommandTransport
+    repo           : PropertyRepository
     props          : Properties
     demux          : FrameDemux
-    stats          : DeviceStats
     tokens         : SessionTokens
     event_listener : Optional['EventListener']
 
@@ -648,9 +744,9 @@ class Connection:
         self.mux            = mux
         self.dev            = dev
         self.log            = logging.getLogger('mwc11.conn.' + mac.hex('-'))
-        self.port           = CommandTransponder(dev.session_key, mux, tokens)
+        self.port           = CommandTransport(dev.session_key, mux, tokens)
+        self.repo           = PropertyRepository(self.port)
         self.demux          = FrameDemux()
-        self.stats          = DeviceStats()
         self.tokens         = tokens
         self.event_listener = event_listener
 
@@ -677,81 +773,36 @@ class Connection:
             ConstProperty ( CameraSIID.OTA           , OTAPIID.State                   , 'idle' ),
         )
 
-        # read-only: camera_misc.rssi
-        self.props.register(FuncProperty(
-            siid   = CameraSIID.Misc,
-            piid   = CameraMiscPIID.RSSI,
-            ty     = int,
-            getter = self._prop_camera_misc_rssi,
-        ))
+        # register properties from repository
+        self.props.register(self.repo[CameraSIID.Misc, CameraMiscPIID.RSSI])
+        self.props.register(self.repo[CameraSIID.Misc, CameraMiscPIID.BatteryLevel])
 
-        # read-only: camera_misc.battery_level
-        self.props.register(FuncProperty(
-            siid   = CameraSIID.Misc,
-            piid   = CameraMiscPIID.BatteryLevel,
-            ty     = int,
-            getter = self._prop_camera_misc_battery_level,
-        ))
+    async def _cmd_nop(self, _: Packet):
+        pass
 
-    def _do_heartbeat(self, p: Packet):
+    async def _cmd_heartbeat(self, p: Packet):
         data = memoryview(p.data)
         level, rssi, volt = struct.unpack('I4xi2xH', data[:16])
 
-        # update statistics
-        self.stats.rssi = rssi
-        self.stats.bat_volt = volt
-        self.stats.bat_level = level
+        # send the reply, and update properties
+        self.port.post(PacketCmd.Heartbeat)
+        self.repo[CameraSIID.Misc, CameraMiscPIID.RSSI] = rssi
+        self.repo[CameraSIID.Misc, CameraMiscPIID.BatteryLevel] = level
+        self.repo[CameraSIID.Misc, CameraMiscPIID.BatteryVoltage] = volt
 
-        # log the statistics
-        self.log.info('Updated: camera_misc.rssi = %d', rssi)
-        self.log.info('Updated: camera_misc.battery.level = %d%%', level)
-        self.log.info('Updated: camera_misc.battery.voltage = %.3fV', volt / 1000.0)
+    async def _cmd_push_device_uid(self, p: Packet):
+        self.dev.tag = DeviceTag.parse(p.data.rstrip(b'\x00').decode('utf-8'))
+        self.log.debug('Device tag was updated.')
 
-    def _fire_configuration_changed(self):
+        # notify the event listener if
         if self.event_listener:
             self.event_listener.on_configuration_changed()
 
-    async def _prop_camera_misc_rssi(self) -> int:
-        if self.stats.rssi is None: await self._fetch_rssi()
-        if self.stats.rssi is None: return 0
-        return self.stats.rssi
-
-    async def _prop_camera_misc_battery_level(self) -> int:
-        if self.stats.bat_level is None: await self._fetch_battery_stats()
-        if self.stats.bat_level is None: return -1
-        return self.stats.bat_level
-
-    async def _fetch_rssi(self) -> int:
-        try:
-            resp = await self.port.send(PacketCmd.GetWiFiSignal, PacketCmd.WiFiSignal)
-        except TimeoutError:
-            self.log.error('Timeout when fetching RSSI.')
-        else:
-            try:
-                rssi, = struct.unpack('i', resp.data)
-            except ValueError:
-                self.log.error('Cannot parse RSSI. resp = %s', resp)
-            else:
-                self.log.info('Fetched: camera_misc.rssi = %d', rssi)
-                self.stats.rssi = rssi
-
-    async def _fetch_battery_stats(self) -> tuple[int, int]:
-        try:
-            resp = await self.port.send(PacketCmd.GetBatteryStat, PacketCmd.BatteryStat)
-        except TimeoutError:
-            self.log.error('Timeout when fetching battery stats.')
-            return 100
-        else:
-            try:
-                level, volt = struct.unpack('II', resp.data)
-            except ValueError:
-                self.log.error('Cannot parse battery stats. resp = %s', resp)
-                return 100
-            else:
-                self.log.info('Fetched: camera_misc.battery.level = %d%%', level)
-                self.log.info('Fetched: camera_misc.battery.voltage = %.3fV', volt / 1000.0)
-                self.stats.bat_volt = volt
-                self.stats.bat_level = level
+    __command_handlers__ = {
+        PacketCmd.Heartbeat       : _cmd_heartbeat,
+        PacketCmd.PushDeviceUID   : _cmd_push_device_uid,
+        PacketCmd.RequestUSBState : _cmd_nop,
+    }
 
     async def _handle_ports(self):
         while True:
@@ -775,20 +826,11 @@ class Connection:
                 self.log.debug('Received response: %s', req)
                 continue
 
-            # handle heartbeat
-            if req.cmd == PacketCmd.Heartbeat:
-                self._do_heartbeat(req)
-                self.port.post(PacketCmd.Heartbeat)
-                continue
-
-            # handle device ID push
-            if req.cmd == PacketCmd.PushDeviceUID:
-                self.dev.tag = DeviceTag.parse(req.data.rstrip(b'\x00').decode('utf-8'))
-                self.log.debug('Device tag was updated.')
-                self._fire_configuration_changed()
-                continue
-
-            print('mwc11', req)
+            # handle the command, if possible
+            if req.cmd in self.__command_handlers__:
+                await self.__command_handlers__[req.cmd](self, req)
+            else:
+                self.log.debug('Unhandled command %s, dropped.', req.cmd)
 
     async def run(self):
         await asyncio.wait([
