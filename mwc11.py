@@ -12,7 +12,6 @@ from enum import IntEnum
 from logging import Logger
 
 from typing import Any
-from typing import Callable
 from typing import Iterable
 from typing import Optional
 
@@ -46,7 +45,6 @@ from mwc1x import DeviceConfiguration
 
 from props import Property
 from props import Properties
-from props import FuncProperty
 from props import ConstProperty
 
 from props import SIID
@@ -62,6 +60,8 @@ LOG_FMT         = '%(asctime)s %(name)s [%(levelname)s] %(message)s'
 LOG_LEVEL       = logging.DEBUG
 
 REQ_VER         = 2
+CAM_VER         = '1.2.1_1981'
+
 COM_RX_PORT     = 32295
 STATION_PORT    = 6282
 STATION_BIND    = '0.0.0.0'
@@ -472,6 +472,15 @@ class MuxTransport(WriteTransport):
         self.log = logging.getLogger('mwc11.mux')
         super().__init__(None)
 
+    def get_extra_info(self, name: str, default: Any = None):
+        return self.wr.transport.get(name, default)
+
+    def is_closing(self):
+        return self.wr.transport.is_closing()
+
+    def close(self):
+        self.wr.transport.close()
+
     def set_write_buffer_limits(self, high: Optional[int] = None, low: Optional[int] = None):
         self.wr.transport.set_write_buffer_limits(high, low)
 
@@ -507,16 +516,26 @@ class MuxConnection:
         self.log = logging.getLogger('mwc11.mux')
         self.mux = { t: self._new_chan(t, wr) for t in MuxType }
 
+    @property
+    def closed(self) -> bool:
+        return not self.mux
+
     @staticmethod
     def _new_chan(ty: MuxType, wr: StreamWriter) -> tuple[StreamReader, StreamWriter]:
         rd = StreamReader(loop = asyncio.get_running_loop())
         wr = StreamWriter(MuxTransport(ty, wr), Protocol(), rd, asyncio.get_running_loop())
         return rd, wr
 
+    def _flush_mux(self):
+        for rd, wr in self.mux.values():
+            rd.feed_eof()
+            wr.close()
+
     def close(self):
         if self.mux:
-            self.wr.close()
+            self._flush_mux()
             self.mux.clear()
+            self.wr.close()
 
     def reader(self, ty: MuxType) -> StreamReader:
         if not self.mux:
@@ -662,13 +681,17 @@ class PropertyRepository:
         ),
     }
 
-    async def value(self, siid: SIID, piid: PIID) -> Any:
+    async def value(self, siid: SIID, piid: PIID, *, no_fetch: bool = False) -> Any:
         buf = self.__properties__
         (what, name, defv), req, resp, *fmt = buf[siid, piid]
 
         # use the cached value if any
         if name in self.repo:
             return self.repo[name]
+
+        # do not fetch if asked so
+        if no_fetch:
+            return defv
 
         # fetch the value
         try:
@@ -719,6 +742,7 @@ class PropertyRepository:
 class Connection:
     mac            : bytes
     log            : Logger
+    rpc            : MiotRPC
     mux            : MuxConnection
     dev            : DeviceConfiguration
     port           : CommandTransport
@@ -734,6 +758,7 @@ class Connection:
 
     def __init__(self,
         mac            : bytes,
+        rpc            : MiotRPC,
         mux            : MuxConnection,
         dev            : DeviceConfiguration,
         tokens         : SessionTokens,
@@ -741,6 +766,7 @@ class Connection:
         event_listener : Optional[EventListener] = None,
     ):
         self.mac            = mac
+        self.rpc            = rpc
         self.mux            = mux
         self.dev            = dev
         self.log            = logging.getLogger('mwc11.conn.' + mac.hex('-'))
@@ -761,7 +787,7 @@ class Connection:
             ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.LiveStream       , 0      ),
             ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.Distortion       , True   ),
             ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.Resolution       , 0      ),
-            ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.Online           , False  ),
+            ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.Online           , True   ),
             ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.PowerFreq        , 50     ),
             ConstProperty ( CameraSIID.DetectionMisc , DetectionMiscPIID.RecordFreq    , 0      ),
             ConstProperty ( CameraSIID.DetectionMisc , DetectionMiscPIID.RecordLimit   , 10     ),
@@ -804,17 +830,61 @@ class Connection:
         PacketCmd.RequestUSBState : _cmd_nop,
     }
 
+    async def _keepalive(self):
+        while True:
+            fut = []
+            rssi = await self.repo.value(CameraSIID.Misc, CameraMiscPIID.RSSI, no_fetch = True)
+
+            # report the subdev info
+            fut.append(self.rpc.send('_sync.subdev_upinfo',
+                did    = self.dev.tag.did,
+                fw_ver = CAM_VER,
+            ))
+
+            # report the subdev keep-alive signal
+            fut.append(self.rpc.send('_sync.subdev_keep_alive', {
+                'did'  : self.dev.tag.did,
+                'rssi' : rssi,
+            }))
+
+            # mark the device as online
+            fut.append(self.rpc.send('properties_changed', {
+                'did'   : self.dev.tag.did,
+                'siid'  : CameraSIID.Misc,
+                'piid'  : CameraMiscPIID.Online,
+                'value' : True,
+            }))
+
+            # perform above actions concurrently
+            try:
+                await asyncio.gather(*fut)
+            except TimeoutError:
+                self.log.warning('Keepalive timeout. Try again later.')
+
+            # check for exit condition
+            if not self.mux.closed:
+                await asyncio.sleep(10.0)
+            else:
+                break
+
     async def _handle_ports(self):
         while True:
-            rd = self.mux.reader(MuxType.ComPort)
-            port = int.from_bytes(await rd.readexactly(2), 'big')
-            self.log.debug('Update COM_SEND port to %d.', port)
-            self.tokens.update(port)
+            try:
+                rd = self.mux.reader(MuxType.ComPort)
+                port = int.from_bytes(await rd.readexactly(2), 'big')
+            except EOFError:
+                break
+            else:
+                self.log.debug('Update COM_SEND port to %d.', port)
+                self.tokens.update(port)
 
     async def _handle_requests(self):
         while True:
-            rd = self.mux.reader(MuxType.ComData)
-            req = await PacketSerdes.read(rd, key = self.dev.session_key)
+            try:
+                rd = self.mux.reader(MuxType.ComData)
+                req = await PacketSerdes.read(rd, key = self.dev.session_key)
+            except EOFError:
+                break
 
             # verify token
             if req.token != self.tokens.rx:
@@ -834,6 +904,7 @@ class Connection:
 
     async def run(self):
         await asyncio.wait([
+            asyncio.get_running_loop().create_task(self._keepalive()),
             asyncio.get_running_loop().create_task(self._handle_ports()),
             asyncio.get_running_loop().create_task(self._handle_requests()),
         ])
@@ -1001,7 +1072,7 @@ class MWC11:
     class EventListener(Connection.EventListener):
         cfg: Configuration
 
-        def __init__(self, cfg: Configuration) -> None:
+        def __init__(self, cfg: Configuration):
             self.cfg = cfg
 
         def on_configuration_changed(self):
@@ -1038,6 +1109,12 @@ class MWC11:
         buf = await mux.reader(MuxType.StaInit).readexactly(14)
         mac, local, remote = struct.unpack('>6s4s4s', buf)
 
+        # check for MAC address
+        if mac in self.cam:
+            mux.close()
+            self.log.warning('Duplicated connection from "%s", dropped.', mac.hex(':'))
+            return
+
         # find the session key
         cfg = self.cfg
         dev = cfg.devices.get(mac)
@@ -1065,6 +1142,7 @@ class MWC11:
             mac            = mac,
             mux            = mux,
             dev            = dev,
+            rpc            = self.rpc,
             tokens         = SessionTokens(dev.session_key, local, remote),
             event_listener = self.EventListener(self.cfg),
         )
@@ -1078,5 +1156,8 @@ class MWC11:
             await conn.run()
         except Exception:
             self.log.exception('Error when handling connection from "%s":', mac.hex(':'))
+        else:
+            self.log.info('Connection from "%s" closed.', mac.hex(':'))
         finally:
             self.cam.pop(conn.mac, None)
+            mux.close()

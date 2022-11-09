@@ -39,7 +39,7 @@ from asyncio import StreamReader
 from asyncio import StreamWriter
 
 HEADER_SIZE         = 8
-REQUEST_TIMEOUT     = 10
+REQUEST_TIMEOUT     = 5
 TIMESYNC_INTERVAL   = 30
 HEARTBEAT_INTERVAL  = 10
 

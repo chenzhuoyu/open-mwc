@@ -157,7 +157,7 @@ class MiotApp(MiotApplication):
         self.log.debug('RPC response: %r', RPCResponse(p.id, data = data, error = error))
         self.rpc.reply_to(p, data = data, error = error)
 
-    async def device_ready(self):
+    async def _stats(self):
         await asyncio.wait([
             self.rpc.send('props', ota_state = 'idle'),
             self.rpc.send('_async.stat',
@@ -195,8 +195,14 @@ class MiotApp(MiotApplication):
                 },
             ),
         ])
-        # print('_sync.subdev_upinfo', await self.rpc.send('_sync.subdev_upinfo', did = '589340360', fw_ver = '1.2.1_1999'))
-        # self.task = asyncio.create_task(self._keepalive())
+
+    async def device_ready(self):
+        try:
+            while True:
+                await self._stats()
+                await asyncio.sleep(30.0)
+        except Exception:
+            self.log.exception('Unhandled exception when reporting stats:')
 
     async def handle_request(self, p: RPCRequest):
         meth = p.method
