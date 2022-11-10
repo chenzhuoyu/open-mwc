@@ -495,7 +495,8 @@ macro_rules! add_tcp_prob_opt {
     ($fut:expr, $chan:ident, $mac:expr, $conn:expr) => {
         if let Some(cc) = $conn.as_mut() {
             $fut.push(Box::pin(async {
-                tcp_read_buf(cc).await?;
+                let mut c = cc;
+                while !tcp_read_buf(&mut c).await?.is_empty() {}
                 Ok(MuxEvent::Dropped($mac, Channel::$chan))
             }));
         }
