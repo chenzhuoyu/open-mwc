@@ -19,6 +19,17 @@ pub type Unit = Maybe<()>;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Maybe<T> = Result<T, Error>;
 
+pub trait IntoV4<T>: Sized {
+    fn into_v4(self) -> T;
+}
+
+impl IntoV4<SocketAddrV4> for SocketAddr {
+    fn into_v4(self) -> SocketAddrV4 {
+        let SocketAddr::V4(ret) = self else { unreachable!() };
+        ret
+    }
+}
+
 pub trait FromPort {
     fn from_port(port: u16) -> Self;
 }
@@ -34,7 +45,7 @@ pub fn as_err<T: std::error::Error + Send + Sync + 'static>(e: T) -> Error {
     Box::new(e) as Error
 }
 
-pub async fn udp_recv_v4(udp: &UdpSocket) -> Maybe<(BytesMut, SocketAddrV4)> {
+pub async fn udp_recv_v4(udp: &UdpSocket) -> IoResult<(BytesMut, SocketAddrV4)> {
     loop {
         let mut buf = [0u8; 65536];
         let (size, addr) = udp.recv_from(&mut buf).await?;
@@ -47,16 +58,22 @@ pub async fn udp_recv_v4(udp: &UdpSocket) -> Maybe<(BytesMut, SocketAddrV4)> {
 }
 
 pub async fn tcp_read_buf<T: AsyncReadExt + Unpin>(mut rd: T) -> IoResult<BytesMut> {
-    let mut buf = BytesMut::with_capacity(65536);
-    let len = rd.read_buf(&mut buf).await?;
-    Ok(buf.split_to(len))
+    let mut buf = [0u8; 65536];
+    let ret = rd.read(&mut buf).await;
+
+    /* remap certain errors to EOF */
+    match ret {
+        Ok(len) => Ok(buf[..len].into()),
+        Err(err) if err.kind() == ErrorKind::ConnectionReset => Ok(BytesMut::new()),
+        Err(err) => Err(err),
+    }
 }
 
-pub async fn tcp_accept_v4(srv: &TcpListener) -> Maybe<(TcpStream, SocketAddrV4)> {
+pub async fn tcp_accept_v4(srv: &TcpListener) -> IoResult<(TcpStream, SocketAddrV4)> {
     loop {
         match srv.accept().await {
             Ok((conn, SocketAddr::V4(addr))) => return Ok((conn, addr)),
-            Err(err) if err.kind() != ErrorKind::ConnectionAborted => return Err(as_err(err)),
+            Err(err) if err.kind() != ErrorKind::ConnectionAborted => return Err(err),
             _ => {}
         }
     }

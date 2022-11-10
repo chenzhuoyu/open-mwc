@@ -13,7 +13,7 @@ use mwc11mux::{
     as_err,
     log::ConsoleLogger,
     options::Options,
-    tcp_accept_v4, tcp_read_buf, udp_recv_v4, FromPort, Maybe, Unit,
+    tcp_accept_v4, tcp_read_buf, udp_recv_v4, FromPort, IntoV4, Maybe, Unit,
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -23,15 +23,23 @@ use tokio::{
 const DSP_COMM_PORT: u16 = 32290;
 const COM_SEND_PORT: u16 = 32293;
 const COM_RECV_PORT: u16 = 32295;
-const UDP_COMM_PORT: u16 = 32392;
-const UDP_DATA_PORT: u16 = 32380;
+const UDP_SEND_PORT: u16 = 32392;
+const UDP_RECV_PORT: u16 = 32380;
 
+#[repr(u8)]
+#[derive(Debug)]
+enum Event {
+    Connected = 0,
+    Disconnected = 1,
+}
+
+#[repr(u8)]
 #[derive(Clone, Copy, Debug)]
 enum Channel {
-    ComSend,
-    ComRecv,
-    DspComm,
-    UdpComm,
+    ComSend = 0,
+    ComRecv = 1,
+    DspComm = 2,
+    UdpSend = 3,
 }
 
 impl Display for Channel {
@@ -40,7 +48,7 @@ impl Display for Channel {
             Channel::ComSend => write!(f, "COM_SEND"),
             Channel::ComRecv => write!(f, "COM_RECV"),
             Channel::DspComm => write!(f, "DSP_COMM"),
-            Channel::UdpComm => write!(f, "UDP_COMM"),
+            Channel::UdpSend => write!(f, "UDP_SEND"),
         }
     }
 }
@@ -53,18 +61,17 @@ enum MuxEvent {
     ComSend(SocketAddrV4, TcpStream),
     ComRecv(SocketAddrV4, TcpStream),
     DspComm(SocketAddrV4, TcpStream),
-    UdpComm(SocketAddrV4, TcpStream),
+    UdpSend(SocketAddrV4, TcpStream),
 }
 
 #[repr(u8)]
 #[derive(Debug)]
 enum PacketType {
     StaInit = 0,
-    ComPort = 1,
-    UdpData = 2,
-    ComData = 3,
-    DspComm = 4,
-    UdpComm = 5,
+    StaConn = 1,
+    ComData = 2,
+    DspComm = 3,
+    UdpData = 4,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -73,11 +80,10 @@ impl TryFrom<u8> for PacketType {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::StaInit),
-            1 => Ok(Self::ComPort),
-            2 => Ok(Self::UdpData),
-            3 => Ok(Self::ComData),
-            4 => Ok(Self::DspComm),
-            5 => Ok(Self::UdpComm),
+            1 => Ok(Self::StaConn),
+            2 => Ok(Self::ComData),
+            3 => Ok(Self::DspComm),
+            4 => Ok(Self::UdpData),
             _ => Err(IoError::from(ErrorKind::InvalidInput)),
         }
     }
@@ -97,7 +103,7 @@ struct Connection {
     com_send: Option<TcpStream>,
     com_recv: Option<TcpStream>,
     dsp_comm: Option<TcpStream>,
-    udp_comm: Option<TcpStream>,
+    udp_send: Option<TcpStream>,
 }
 
 impl Connection {
@@ -168,21 +174,23 @@ impl Connection {
             }
         };
 
-        /* get the length of both parts */
-        let n1 = mac.bytes().len() as u32;
-        let n2 = addr.local.octets().len() as u32;
-        let n3 = addr.remote.octets().len() as u32;
-
         /* send the initialization packet */
         sta.write_u8(PacketType::StaInit as u8).await?;
-        sta.write_u32(n1 + n2 + n3).await?;
+        sta.write_u32(14).await?;
         sta.write_all(&mac.bytes()).await?;
-        sta.write_all(&addr.local.octets()).await?;
-        sta.write_all(&addr.remote.octets()).await?;
+        sta.write_u32(addr.local.into()).await?;
+        sta.write_u32(addr.remote.into()).await?;
 
         /* set the COM_SEND port if any */
         if let Some(cc) = send.as_ref() {
-            Self::update_tx_port(&mut sta, cc.peer_addr()?.port()).await?;
+            let addr = cc.peer_addr()?.into_v4();
+            Self::notify(&mut sta, addr, Channel::ComSend, Event::Connected).await?;
+        }
+
+        /* set the COM_RECV port if any */
+        if let Some(cc) = recv.as_ref() {
+            let addr = cc.peer_addr()?.into_v4();
+            Self::notify(&mut sta, addr, Channel::ComRecv, Event::Connected).await?;
         }
 
         /* construct the new connection */
@@ -195,16 +203,19 @@ impl Connection {
             com_send: send,
             com_recv: recv,
             dsp_comm: None,
-            udp_comm: None,
+            udp_send: None,
         })
     }
 }
 
 impl Connection {
-    async fn update_tx_port(sta: &mut TcpStream, port: u16) -> Unit {
-        sta.write_u8(PacketType::ComPort as u8).await?;
-        sta.write_u32(2).await?;
-        sta.write_u16(port).await?;
+    async fn notify(sta: &mut TcpStream, addr: SocketAddrV4, chan: Channel, event: Event) -> Unit {
+        sta.write_u8(PacketType::StaConn as u8).await?;
+        sta.write_u32(8).await?;
+        sta.write_u8(chan as u8).await?;
+        sta.write_u8(event as u8).await?;
+        sta.write_u16(addr.port()).await?;
+        sta.write_u32((*addr.ip()).into()).await?;
         Ok(())
     }
 }
@@ -239,7 +250,7 @@ impl Connection {
                 log::warn!("Unexpected STA_INIT packet, dropped.");
                 Ok(())
             }
-            PacketType::ComPort => {
+            PacketType::StaConn => {
                 log::warn!("Unexpected COM_PEER packet, dropped.");
                 Ok(())
             }
@@ -257,16 +268,10 @@ impl Connection {
                 }
             }
             PacketType::DspComm => {
-                if let Some(conn) = self.dsp_comm.as_mut() {
+                if let Some(conn) = self.udp_send.as_mut() {
                     conn.write_all_buf(&mut buf).await?;
                     Ok(())
-                } else {
-                    log::warn!("DSP_COMM for {} is not ready, dropped.", &self.mac);
-                    Ok(())
-                }
-            }
-            PacketType::UdpComm => {
-                if let Some(conn) = self.udp_comm.as_mut() {
+                } else if let Some(conn) = self.dsp_comm.as_mut() {
                     conn.write_all_buf(&mut buf).await?;
                     Ok(())
                 } else {
@@ -307,8 +312,68 @@ impl Connection {
                 if *v.ip() == self.addr.local && *r.ip() == self.addr.remote =>
             {
                 conn.write_all_buf(&mut self.com_chan).await?;
-                Self::update_tx_port(&mut self.sta, r.port()).await?;
+                Self::notify(&mut self.sta, r, Channel::ComSend, Event::Connected).await?;
                 self.com_send = Some(conn);
+                Ok(())
+            }
+            (SocketAddr::V4(r), SocketAddr::V4(v)) => Err(as_err(IoError::new(
+                ErrorKind::PermissionDenied,
+                format!("MAC address confliction: {} and {}", r.ip(), v.ip()),
+            ))),
+            (SocketAddr::V6(v), _) | (_, SocketAddr::V6(v)) => Err(as_err(IoError::new(
+                ErrorKind::Unsupported,
+                format!("IPv6 address {} is not supported", v.ip()),
+            ))),
+        }
+    }
+
+    async fn update_com_recv(&mut self, conn: TcpStream) -> Unit {
+        match (conn.peer_addr()?, conn.local_addr()?) {
+            (SocketAddr::V4(r), SocketAddr::V4(v))
+                if *v.ip() == self.addr.local && *r.ip() == self.addr.remote =>
+            {
+                Self::notify(&mut self.sta, r, Channel::ComRecv, Event::Connected).await?;
+                self.com_recv = Some(conn);
+                Ok(())
+            }
+            (SocketAddr::V4(r), SocketAddr::V4(v)) => Err(as_err(IoError::new(
+                ErrorKind::PermissionDenied,
+                format!("MAC address confliction: {} and {}", r.ip(), v.ip()),
+            ))),
+            (SocketAddr::V6(v), _) | (_, SocketAddr::V6(v)) => Err(as_err(IoError::new(
+                ErrorKind::Unsupported,
+                format!("IPv6 address {} is not supported", v.ip()),
+            ))),
+        }
+    }
+
+    async fn update_dsp_comm(&mut self, conn: TcpStream) -> Unit {
+        match (conn.peer_addr()?, conn.local_addr()?) {
+            (SocketAddr::V4(r), SocketAddr::V4(v))
+                if *v.ip() == self.addr.local && *r.ip() == self.addr.remote =>
+            {
+                Self::notify(&mut self.sta, r, Channel::DspComm, Event::Connected).await?;
+                self.dsp_comm = Some(conn);
+                Ok(())
+            }
+            (SocketAddr::V4(r), SocketAddr::V4(v)) => Err(as_err(IoError::new(
+                ErrorKind::PermissionDenied,
+                format!("MAC address confliction: {} and {}", r.ip(), v.ip()),
+            ))),
+            (SocketAddr::V6(v), _) | (_, SocketAddr::V6(v)) => Err(as_err(IoError::new(
+                ErrorKind::Unsupported,
+                format!("IPv6 address {} is not supported", v.ip()),
+            ))),
+        }
+    }
+
+    async fn update_udp_send(&mut self, conn: TcpStream) -> Unit {
+        match (conn.peer_addr()?, conn.local_addr()?) {
+            (SocketAddr::V4(r), SocketAddr::V4(v))
+                if *v.ip() == self.addr.local && *r.ip() == self.addr.remote =>
+            {
+                Self::notify(&mut self.sta, r, Channel::UdpSend, Event::Connected).await?;
+                self.udp_send = Some(conn);
                 Ok(())
             }
             (SocketAddr::V4(r), SocketAddr::V4(v)) => Err(as_err(IoError::new(
@@ -324,65 +389,17 @@ impl Connection {
 }
 
 impl Connection {
-    fn update_com_recv(&mut self, conn: TcpStream) -> Unit {
-        match (conn.peer_addr()?.ip(), conn.local_addr()?.ip()) {
-            (IpAddr::V4(r), IpAddr::V4(v)) if v == self.addr.local && r == self.addr.remote => {
-                self.com_recv = Some(conn);
-                Ok(())
-            }
-            (IpAddr::V4(r), IpAddr::V4(v)) => Err(as_err(IoError::new(
-                ErrorKind::PermissionDenied,
-                format!("MAC address confliction: {} and {}", &r, &v),
-            ))),
-            (IpAddr::V6(v), _) | (_, IpAddr::V6(v)) => Err(as_err(IoError::new(
-                ErrorKind::Unsupported,
-                format!("IPv6 address {} is not supported", &v),
-            ))),
-        }
-    }
-
-    fn update_dsp_comm(&mut self, conn: TcpStream) -> Unit {
-        match (conn.peer_addr()?.ip(), conn.local_addr()?.ip()) {
-            (IpAddr::V4(r), IpAddr::V4(v)) if v == self.addr.local && r == self.addr.remote => {
-                self.dsp_comm = Some(conn);
-                Ok(())
-            }
-            (IpAddr::V4(r), IpAddr::V4(v)) => Err(as_err(IoError::new(
-                ErrorKind::PermissionDenied,
-                format!("MAC address confliction: {} and {}", &r, &v),
-            ))),
-            (IpAddr::V6(v), _) | (_, IpAddr::V6(v)) => Err(as_err(IoError::new(
-                ErrorKind::Unsupported,
-                format!("IPv6 address {} is not supported", &v),
-            ))),
-        }
-    }
-
-    fn update_udp_comm(&mut self, conn: TcpStream) -> Unit {
-        match (conn.peer_addr()?.ip(), conn.local_addr()?.ip()) {
-            (IpAddr::V4(r), IpAddr::V4(v)) if v == self.addr.local && r == self.addr.remote => {
-                self.udp_comm = Some(conn);
-                Ok(())
-            }
-            (IpAddr::V4(r), IpAddr::V4(v)) => Err(as_err(IoError::new(
-                ErrorKind::PermissionDenied,
-                format!("MAC address confliction: {} and {}", &r, &v),
-            ))),
-            (IpAddr::V6(v), _) | (_, IpAddr::V6(v)) => Err(as_err(IoError::new(
-                ErrorKind::Unsupported,
-                format!("IPv6 address {} is not supported", &v),
-            ))),
-        }
-    }
-}
-
-impl Connection {
-    fn drop_channel(&mut self, chan: Channel) {
-        match chan {
-            Channel::ComSend => self.com_send = None,
-            Channel::ComRecv => self.com_recv = None,
-            Channel::DspComm => self.dsp_comm = None,
-            Channel::UdpComm => self.udp_comm = None,
+    async fn drop_channel(&mut self, chan: Channel) -> Unit {
+        if let Some(conn) = match chan {
+            Channel::ComSend => self.com_send.take(),
+            Channel::ComRecv => self.com_recv.take(),
+            Channel::DspComm => self.dsp_comm.take(),
+            Channel::UdpSend => self.udp_send.take(),
+        } {
+            let addr = conn.peer_addr()?.into_v4();
+            Self::notify(&mut self.sta, addr, chan, Event::Disconnected).await
+        } else {
+            Ok(())
         }
     }
 }
@@ -390,11 +407,11 @@ impl Connection {
 struct ConnectionMux {
     sta: SocketAddr,
     conn: HashMap<MACAddress, Connection>,
-    udp_data: UdpSocket,
+    udp_recv: UdpSocket,
     com_recv: TcpListener,
     com_send: TcpListener,
     dsp_comm: TcpListener,
-    udp_comm: TcpListener,
+    udp_send: TcpListener,
 }
 
 impl ConnectionMux {
@@ -407,26 +424,26 @@ impl ConnectionMux {
         log::info!("TCP: COM_RECV at port {}", COM_RECV_PORT);
         log::info!("TCP: COM_SEND at port {}", COM_SEND_PORT);
         log::info!("TCP: DSP_COMM at port {}", DSP_COMM_PORT);
-        log::info!("TCP: UDP_COMM at port {}", UDP_COMM_PORT);
-        log::info!("UDP: UDP_DATA at port {}", UDP_DATA_PORT);
+        log::info!("TCP: UDP_SEND at port {}", UDP_SEND_PORT);
+        log::info!("UDP: UDP_RECV at port {}", UDP_RECV_PORT);
         log::info!("---------------------------------");
 
         /* start servers */
-        let udp_data = UdpSocket::bind(SocketAddrV4::from_port(UDP_DATA_PORT)).await?;
+        let udp_recv = UdpSocket::bind(SocketAddrV4::from_port(UDP_RECV_PORT)).await?;
         let com_recv = TcpListener::bind(SocketAddrV4::from_port(COM_RECV_PORT)).await?;
         let com_send = TcpListener::bind(SocketAddrV4::from_port(COM_SEND_PORT)).await?;
         let dsp_comm = TcpListener::bind(SocketAddrV4::from_port(DSP_COMM_PORT)).await?;
-        let udp_comm = TcpListener::bind(SocketAddrV4::from_port(UDP_COMM_PORT)).await?;
+        let udp_send = TcpListener::bind(SocketAddrV4::from_port(UDP_SEND_PORT)).await?;
 
         /* construct the mux */
         let mux = Self {
             sta,
             conn,
-            udp_data,
+            udp_recv,
             com_recv,
             com_send,
             dsp_comm,
-            udp_comm,
+            udp_send,
         };
 
         /* start the event loop */
@@ -498,15 +515,15 @@ impl ConnectionMux {
                 add_tcp_prob_opt!(fut, ComSend, *mac, conn.com_send);
                 add_tcp_read_opt!(fut, ComData, *mac, conn.com_recv);
                 add_tcp_prob_opt!(fut, DspComm, *mac, conn.dsp_comm);
-                add_tcp_prob_opt!(fut, UdpComm, *mac, conn.udp_comm);
+                add_tcp_prob_opt!(fut, UdpSend, *mac, conn.udp_send);
             }
 
             /* add all server listeners */
             add_tcp_server!(fut, ComSend, &self.com_send);
             add_tcp_server!(fut, ComRecv, &self.com_recv);
             add_tcp_server!(fut, DspComm, &self.dsp_comm);
-            add_tcp_server!(fut, UdpComm, &self.udp_comm);
-            add_udp_server!(fut, UdpData, &self.udp_data);
+            add_tcp_server!(fut, UdpSend, &self.udp_send);
+            add_udp_server!(fut, UdpData, &self.udp_recv);
 
             /* select from those futures */
             let event = match fut.next().await {
@@ -528,7 +545,7 @@ impl ConnectionMux {
                 cc.com_send.is_some()
                     || cc.com_recv.is_some()
                     || cc.dsp_comm.is_some()
-                    || cc.udp_comm.is_some()
+                    || cc.udp_send.is_some()
             });
         }
     }
@@ -538,7 +555,7 @@ impl ConnectionMux {
             MuxEvent::Dropped(mac, ch) => {
                 if let Some(conn) = self.conn.get_mut(&mac) {
                     log::info!("Channel {} for {} is closed.", ch, &mac);
-                    conn.drop_channel(ch);
+                    conn.drop_channel(ch).await?;
                     Ok(())
                 } else {
                     log::warn!("Dropping non-existing connection {}.", &mac);
@@ -562,7 +579,7 @@ impl ConnectionMux {
                 if let Some(conn) = self.conn.get_mut(&mac) {
                     if buf.is_empty() {
                         log::info!("Channel COM_RECV for {} is closed.", &mac);
-                        conn.drop_channel(Channel::ComRecv);
+                        conn.drop_channel(Channel::ComRecv).await?;
                         Ok(())
                     } else {
                         conn.handle_com_recv(buf).await?;
@@ -609,11 +626,11 @@ impl ConnectionMux {
                 )
                 .await
             }
-            MuxEvent::UdpComm(addr, conn) => {
+            MuxEvent::UdpSend(addr, conn) => {
                 self.resolve_source_mac(
                     "resolve MAC address for UDP_COMM channel",
                     addr,
-                    Self::accept_udp_comm,
+                    Self::accept_udp_send,
                     conn,
                 )
                 .await
@@ -676,7 +693,7 @@ impl ConnectionMux {
 
     async fn accept_com_recv(&mut self, mac: MACAddress, conn: TcpStream) -> Unit {
         if let Some(ctx) = self.conn.get_mut(&mac) {
-            ctx.update_com_recv(conn)?;
+            ctx.update_com_recv(conn).await?;
             log::info!("Updated COM_RECV channel for {}.", &mac);
             Ok(())
         } else {
@@ -696,7 +713,7 @@ impl ConnectionMux {
 
     async fn accept_dsp_comm(&mut self, mac: MACAddress, conn: TcpStream) -> Unit {
         if let Some(ctx) = self.conn.get_mut(&mac) {
-            ctx.update_dsp_comm(conn)?;
+            ctx.update_dsp_comm(conn).await?;
             log::info!("Updated DSP_COMM channel for {}.", &mac);
             Ok(())
         } else {
@@ -705,13 +722,13 @@ impl ConnectionMux {
         }
     }
 
-    async fn accept_udp_comm(&mut self, mac: MACAddress, conn: TcpStream) -> Unit {
+    async fn accept_udp_send(&mut self, mac: MACAddress, conn: TcpStream) -> Unit {
         if let Some(ctx) = self.conn.get_mut(&mac) {
-            ctx.update_udp_comm(conn)?;
-            log::info!("Updated UDP_COMM channel for {}.", &mac);
+            ctx.update_udp_send(conn).await?;
+            log::info!("Updated UDP_SEND channel for {}.", &mac);
             Ok(())
         } else {
-            log::warn!("Unexpected UDP_COMM channel from {}, dropped.", &mac);
+            log::warn!("Unexpected UDP_SEND channel from {}, dropped.", &mac);
             Ok(())
         }
     }
