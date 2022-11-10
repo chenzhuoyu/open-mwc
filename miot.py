@@ -616,16 +616,22 @@ class MiotRPC:
                 self.incr += 1
                 return rid
 
+    def _drop_timer(self, pid: int):
+        if pid in self.waiter:
+            self.waiter.pop(pid)[1].cancel()
+
     def _fire_timeout(self, pid: int):
-        fut = self.waiter.pop(pid, None)
-        fut and fut[0].set_exception(TimeoutError)
+        if pid in self.waiter:
+            fut, _ = self.waiter.pop(pid)
+            fut.cancelled() or fut.set_exception(TimeoutError)
 
     def _send_request(self, req: RPCRequest) -> Future[RPCResponse]:
         snd = self.sender()
         fut = asyncio.get_running_loop().create_future()
         tmr = asyncio.get_running_loop().call_later(REQUEST_TIMEOUT, self._fire_timeout, req.id)
-        snd.send_packet(Packet.request(snd.next_seq(), req))
         self.waiter[req.id] = (fut, tmr)
+        snd.send_packet(Packet.request(snd.next_seq(), req))
+        fut.add_done_callback(lambda _: self._drop_timer(req.id))
         return fut
 
     @staticmethod

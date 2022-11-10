@@ -66,7 +66,6 @@ COM_RX_PORT     = 32295
 STATION_PORT    = 6282
 STATION_BIND    = '0.0.0.0'
 
-SECRET_MAGIC    = 0xee00ff11
 STREAM_MAGIC    = 0x55aa55aa
 SENDER_MAGIC    = 0xff00aaaa
 RECVER_MAGIC    = 0xff005555
@@ -420,11 +419,10 @@ class FrameDemux:
 
 class MuxType(IntEnum):
     StaInit = 0
-    ComPort = 1
-    UdpData = 2
-    ComData = 3
-    DspComm = 4
-    UdpComm = 5
+    StaConn = 1
+    ComData = 2
+    DspComm = 3
+    UdpData = 4,
 
 class MuxFrame:
     ty  : MuxType
@@ -592,7 +590,7 @@ class CommandTransport:
     key    : SessionKey
     mux    : MuxConnection
     token  : SessionTokens
-    waiter : dict[PacketCmd, tuple[TimerHandle, Future[Packet]]]
+    waiter : dict[PacketCmd, tuple[Future[Packet], TimerHandle]]
 
     def __init__(self, key: SessionKey, mux: MuxConnection, token: SessionTokens):
         self.key    = key
@@ -600,16 +598,22 @@ class CommandTransport:
         self.token  = token
         self.waiter = {}
 
+    def _drop_timer(self, cmd: PacketCmd):
+        if cmd in self.waiter:
+            self.waiter.pop(cmd)[1].cancel()
+
     def _fire_timeout(self, cmd: PacketCmd):
         if cmd in self.waiter:
-            _, fut = self.waiter.pop(cmd)
-            fut.set_exception(TimeoutError)
+            fut, _ = self.waiter.pop(cmd)
+            fut.cancelled() or fut.set_exception(TimeoutError)
 
     def _send_request(self, req: Packet, resp: PacketCmd, timeout: float) -> Future[Packet]:
+        com = self.mux.writer(MuxType.ComData)
         fut = asyncio.get_running_loop().create_future()
         tmr = asyncio.get_running_loop().call_later(timeout, self._fire_timeout, resp)
-        PacketSerdes.write(self.mux.writer(MuxType.ComData), req, key = self.key)
-        self.waiter[resp] = (tmr, fut)
+        self.waiter[resp] = (fut, tmr)
+        PacketSerdes.write(com, req, key = self.key)
+        fut.add_done_callback(lambda _: self._drop_timer(resp))
         return fut
 
     def post(self, cmd: PacketCmd, *, data: bytes = b''):
@@ -624,7 +628,7 @@ class CommandTransport:
 
     def handle_packet(self, p: Packet) -> bool:
         cmd = p.cmd
-        tmr, fut = self.waiter.pop(cmd, (None, None))
+        fut, tmr = self.waiter.pop(cmd, (None, None))
 
         # check if it is the expected packet
         if tmr is None:
@@ -739,6 +743,16 @@ class PropertyRepository:
         siid, piid = key
         self.update(siid, piid, value)
 
+class Channel(IntEnum):
+    ComSend = 0
+    ComRecv = 1
+    DspComm = 2
+    UdpSend = 3
+
+class ChannelEvent(IntEnum):
+    Connected    = 0,
+    Disconnected = 1
+
 class Connection:
     mac            : bytes
     log            : Logger
@@ -811,7 +825,6 @@ class Connection:
         level, rssi, volt = struct.unpack('I4xi2xH', data[:16])
 
         # send the reply, and update properties
-        self.port.post(PacketCmd.Heartbeat)
         self.repo[CameraSIID.Misc, CameraMiscPIID.RSSI] = rssi
         self.repo[CameraSIID.Misc, CameraMiscPIID.BatteryLevel] = level
         self.repo[CameraSIID.Misc, CameraMiscPIID.BatteryVoltage] = volt
@@ -856,27 +869,51 @@ class Connection:
             }))
 
             # perform above actions concurrently
-            try:
-                await asyncio.gather(*fut)
-            except TimeoutError:
-                self.log.warning('Keepalive timeout. Try again later.')
+            while fut and not self.mux.closed:
+                done, fut = await asyncio.wait(fut, timeout = 1.0)
+                errors = [f.exception() for f in done]
 
-            # check for exit condition
-            if not self.mux.closed:
-                await asyncio.sleep(10.0)
-            else:
-                break
+                # check for exceptions in every completed futures
+                if any(isinstance(e, TimeoutError) for e in errors):
+                    self.log.warning('Keepalive timeout. Try again later.')
+                    break
 
-    async def _handle_ports(self):
+            # cancel remaining futures
+            for fut in fut:
+                fut.cancel()
+
+            # wait for 10 seconds
+            for _ in range(10):
+                if not self.mux.closed:
+                    await asyncio.sleep(1.0)
+                else:
+                    return
+
+    async def _handle_events(self):
         while True:
             try:
-                rd = self.mux.reader(MuxType.ComPort)
-                port = int.from_bytes(await rd.readexactly(2), 'big')
+                rd = self.mux.reader(MuxType.StaConn)
+                chan, event, port, addr = struct.unpack('BBH4s', await rd.readexactly(8))
             except EOFError:
                 break
-            else:
-                self.log.debug('Update COM_SEND port to %d.', port)
-                self.tokens.update(port)
+
+            # check the channel and event
+            try:
+                chan = Channel(chan)
+                event = ChannelEvent(event)
+            except ValueError:
+                self.log.error('Invalid event data, dropped.')
+                continue
+
+            # log the event
+            addr = socket.inet_ntop(socket.AF_INET, addr)
+            self.log.debug('Received event from %s:%d. event = %s.%s', addr, port, chan.name, event.name)
+
+            # handle the events
+            match chan, event:
+                case Channel.ComSend, ChannelEvent.Connected:
+                    self.log.debug('Update COM_SEND channel to %s:%d.', addr, port)
+                    self.tokens.update(port)
 
     async def _handle_requests(self):
         while True:
@@ -905,7 +942,7 @@ class Connection:
     async def run(self):
         await asyncio.wait([
             asyncio.get_running_loop().create_task(self._keepalive()),
-            asyncio.get_running_loop().create_task(self._handle_ports()),
+            asyncio.get_running_loop().create_task(self._handle_events()),
             asyncio.get_running_loop().create_task(self._handle_requests()),
         ])
 
