@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import logs
 import time
 import socket
 import struct
@@ -12,7 +13,6 @@ from enum import IntEnum
 from logging import Logger
 
 from typing import Any
-from typing import Iterable
 from typing import Optional
 
 from asyncio import Queue
@@ -43,12 +43,9 @@ from mwc1x import DeviceTag
 from mwc1x import Configuration
 from mwc1x import DeviceConfiguration
 
-from props import Property
 from props import Properties
-from props import ConstProperty
+from props import ValueProperty
 
-from props import SIID
-from props import PIID
 from props import OTAPIID
 from props import CameraSIID
 from props import DetectionPIID
@@ -109,40 +106,6 @@ class FrameCmd(IntEnum):
     CmdPipeline = 0xc2
     # Unknown1  = 0xd0  # did nothing after decrypting the buffer
     Nested      = 0xe0
-
-class DspCmd(IntEnum):      # < 0x5015
-    HeartbeatAck            = 0x2754
-    LostIFrame              = 0x2711
-    BroadcastTipVoice       = 0x2757
-    TakeSnapshot            = 0x2742
-    # Unknown1              = 0x4e35    # found in DspComSvr thread
-    GetVideoEncoderInfo     = 0x4e37
-
-class ComSendCmd(IntEnum):  # >= 0x5015
-    EnablePIR               = 0x5016
-    GetPIREnabledStatus     = 0x5017    # 0x26
-    SetPIRSensitivity       = 0x5019
-    GetPIRSensitivity       = 0x501a
-    TimeSync                = 0x501b
-    ClearCameraMatchInfo    = 0x501c
-    SetPIRDelayTime         = 0x501e
-    GetPIRDelayTime         = 0x501f
-    # Unknown1              = 0x5020    # fired when time-sync is successful
-    Heartbeat               = 0x5022
-    UpdateMCUModule         = 0x5023
-    SetPIRWakeupDSP         = 0x5024
-    EnableSpeedTest         = 0x5025
-    EnableTamper            = 0x5026
-    SetQuiescentTime        = 0x502b
-    GetQuiescentTime        = 0x502c
-    EnableTamperWakeupDSP   = 0x5030
-    # Unknown3              = 0x5032    # something related to LEDs?
-    FetchWiFiLog            = 0x5033
-    # Unknown4              = 0x5035    # fired after time-sync is successful
-    Reboot                  = 0x503b
-    GetCameraTemperature    = 0x503e
-    SetGSensorSwitch        = 0x503f
-    SetGSensorSensitivity   = 0x5041
 
 class PacketCmd(IntEnum):
     WakeupMultiFn                   = 0x0c
@@ -279,34 +242,23 @@ class Packet:
 
 class FrameSerdes:
     @staticmethod
-    def decode(buf: bytes, key: SessionKey) -> Iterable[Frame]:
-        while len(buf) >= 24:
-            hdr = buf[:24]
-            magic, ty, seq, size = struct.unpack('IxBH4xH10x', hdr)
+    async def read(rd: StreamReader, key: SessionKey) -> Frame:
+        hdr = await rd.readexactly(24)
+        magic, ty, seq, size = struct.unpack('IxBH4xH10x', hdr)
 
-            # check for magic number
-            if magic != STREAM_MAGIC:
-                raise ValueError('invalid packet header: ' + hdr.hex(' '))
+        # check for magic number
+        if magic != STREAM_MAGIC:
+            raise ValueError('invalid packet header: ' + hdr.hex(' '))
 
-            # calculate padded size
-            if not (size & 0x0f):
-                rlen = size
-            else:
-                rlen = (size & 0xfff0) + 0x10
+        # calculate padded size
+        if not (size & 0x0f):
+            rlen = size
+        else:
+            rlen = (size & 0xfff0) + 0x10
 
-            # check for buffer length
-            if len(buf) < rlen + 24:
-                raise ValueError('incomplete packet')
-
-            # read the encrypted data if any
-            if not rlen:
-                rbuf = b''
-            else:
-                rbuf = key.decrypt(buf[24:rlen + 24], size)
-
-            # construct the packet
-            buf = buf[rlen + 24:]
-            yield Frame(FrameCmd(ty), seq, rbuf)
+        # read and decrypt the frame
+        rbuf = await rd.readexactly(rlen)
+        return Frame(FrameCmd(ty), seq, key.decrypt(rbuf, size))
 
 class PacketSerdes:
     @staticmethod
@@ -639,110 +591,6 @@ class CommandTransport:
         tmr.cancel()
         return True
 
-class PropertyRepository:
-    log  : Logger
-    repo : dict[str, Any]
-    port : CommandTransport
-
-    class PropertySource(Property):
-        repo: 'PropertyRepository'
-
-        def __init__(self, siid: SIID, piid: PIID, ty: type, repo: 'PropertyRepository'):
-            self.repo = repo
-            super().__init__(siid, piid, ty)
-
-        async def _do_read(self) -> Any:
-            return await self.repo.value(self.siid, self.piid)
-
-        async def _do_write(self, value: Any):
-            self.repo.update(self.siid, self.piid, value)
-
-    def __init__(self, port: CommandTransport):
-        self.log  = logging.getLogger('mwc11.repo')
-        self.repo = {}
-        self.port = port
-
-    __properties__ = {
-        (CameraSIID.Misc, CameraMiscPIID.RSSI): (
-            ('RSSI', 'camera_misc.rssi', 0),
-            PacketCmd.GetWiFiSignal,
-            PacketCmd.WiFiSignal,
-            ('i', 'camera_misc.rssi')
-        ),
-        (CameraSIID.Misc, CameraMiscPIID.BatteryLevel): (
-            ('battery stats', 'camera_misc.battery.level', -1),
-            PacketCmd.GetBatteryStat,
-            PacketCmd.BatteryStat,
-            ('I', 'camera_misc.battery.level'),
-            ('I', 'camera_misc.battery.voltage'),
-        ),
-        (CameraSIID.Misc, CameraMiscPIID.BatteryVoltage): (
-            ('battery stats', 'camera_misc.battery.voltage', -1),
-            PacketCmd.GetBatteryStat,
-            PacketCmd.BatteryStat,
-            ('I', 'camera_misc.battery.level'),
-            ('I', 'camera_misc.battery.voltage'),
-        ),
-    }
-
-    async def value(self, siid: SIID, piid: PIID, *, no_fetch: bool = False) -> Any:
-        buf = self.__properties__
-        (what, name, defv), req, resp, *fmt = buf[siid, piid]
-
-        # use the cached value if any
-        if name in self.repo:
-            return self.repo[name]
-
-        # do not fetch if asked so
-        if no_fetch:
-            return defv
-
-        # fetch the value
-        try:
-            ret = await self.port.send(req, resp)
-        except TimeoutError:
-            self.log.error('Timeout when fetching %s.', what)
-            return defv
-
-        # parse the result
-        try:
-            vals = struct.unpack(''.join(f for f, _ in fmt), ret.data)
-        except ValueError:
-            self.log.error('Cannot parse %s. resp = %s', what, ret)
-            return defv
-
-        # update to cache
-        for (_, key), value in zip(fmt, vals):
-            self.log.info('Fetched: %s = %s', key, value)
-            self.repo[key] = value
-
-        # use the default value if still not present
-        if name not in self.repo:
-            return defv
-        else:
-            return self.repo[name]
-
-    def update(self, siid: SIID, piid: PIID, value: Any):
-        buf = self.__properties__
-        (_, name, defv), _, _, *_ = buf[siid, piid]
-
-        # check the type
-        if type(value) != type(defv):
-            raise TypeError('Type mismatch for field ' + name)
-
-        # log and update the value
-        self.log.info('Updated: %s = %s', name, value)
-        self.repo[name] = value
-
-    def __getitem__(self, key: tuple[SIID, PIID]) -> PropertySource:
-        siid, piid = key
-        (_, _, defv), _, _, *_ = self.__properties__[key]
-        return self.PropertySource(siid, piid, type(defv), self)
-
-    def __setitem__(self, key: tuple[SIID, PIID], value: Any):
-        siid, piid = key
-        self.update(siid, piid, value)
-
 class Channel(IntEnum):
     ComSend = 0
     ComRecv = 1
@@ -760,7 +608,6 @@ class Connection:
     mux            : MuxConnection
     dev            : DeviceConfiguration
     port           : CommandTransport
-    repo           : PropertyRepository
     props          : Properties
     demux          : FrameDemux
     tokens         : SessionTokens
@@ -775,6 +622,7 @@ class Connection:
         rpc            : MiotRPC,
         mux            : MuxConnection,
         dev            : DeviceConfiguration,
+        props          : Properties,
         tokens         : SessionTokens,
         *,
         event_listener : Optional[EventListener] = None,
@@ -785,37 +633,10 @@ class Connection:
         self.dev            = dev
         self.log            = logging.getLogger('mwc11.conn.' + mac.hex('-'))
         self.port           = CommandTransport(dev.session_key, mux, tokens)
-        self.repo           = PropertyRepository(self.port)
         self.demux          = FrameDemux()
+        self.props          = props
         self.tokens         = tokens
         self.event_listener = event_listener
-
-        # initialize all const properties
-        self.props = Properties(
-            ConstProperty ( CameraSIID.Control       , CameraControlPIID.PowerSwitch   , True   ),
-            ConstProperty ( CameraSIID.Control       , CameraControlPIID.Flip          , 0      ),
-            ConstProperty ( CameraSIID.Control       , CameraControlPIID.NightVision   , 2      ),
-            ConstProperty ( CameraSIID.Control       , CameraControlPIID.OSDTimestamp  , True   ),
-            ConstProperty ( CameraSIID.Control       , CameraControlPIID.WDR           , True   ),
-            ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.LED              , True   ),
-            ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.LiveStream       , 0      ),
-            ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.Distortion       , True   ),
-            ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.Resolution       , 0      ),
-            ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.Online           , True   ),
-            ConstProperty ( CameraSIID.Misc          , CameraMiscPIID.PowerFreq        , 50     ),
-            ConstProperty ( CameraSIID.DetectionMisc , DetectionMiscPIID.RecordFreq    , 0      ),
-            ConstProperty ( CameraSIID.DetectionMisc , DetectionMiscPIID.RecordLimit   , 10     ),
-            ConstProperty ( CameraSIID.DetectionMisc , DetectionMiscPIID.Enabled       , True   ),
-            ConstProperty ( CameraSIID.Detection     , DetectionPIID.Enabled           , True   ),
-            ConstProperty ( CameraSIID.Detection     , DetectionPIID.RecordInterval    , 30     ),
-            ConstProperty ( CameraSIID.Detection     , DetectionPIID.RecordSensitivity , 100    ),
-            ConstProperty ( CameraSIID.OTA           , OTAPIID.Progress                , 100    ),
-            ConstProperty ( CameraSIID.OTA           , OTAPIID.State                   , 'idle' ),
-        )
-
-        # register properties from repository
-        self.props.register(self.repo[CameraSIID.Misc, CameraMiscPIID.RSSI])
-        self.props.register(self.repo[CameraSIID.Misc, CameraMiscPIID.BatteryLevel])
 
     async def _cmd_nop(self, _: Packet):
         pass
@@ -824,10 +645,10 @@ class Connection:
         data = memoryview(p.data)
         level, rssi, volt = struct.unpack('I4xi2xH', data[:16])
 
-        # send the reply, and update properties
-        self.repo[CameraSIID.Misc, CameraMiscPIID.RSSI] = rssi
-        self.repo[CameraSIID.Misc, CameraMiscPIID.BatteryLevel] = level
-        self.repo[CameraSIID.Misc, CameraMiscPIID.BatteryVoltage] = volt
+        # update properties
+        self.props[CameraSIID.Misc, CameraMiscPIID.RSSI] = rssi
+        self.props[CameraSIID.Misc, CameraMiscPIID.BatteryLevel] = level
+        self.props[CameraSIID.Misc, CameraMiscPIID.BatteryVoltage] = volt
 
     async def _cmd_push_device_uid(self, p: Packet):
         self.dev.tag = DeviceTag.parse(p.data.rstrip(b'\x00').decode('utf-8'))
@@ -839,55 +660,29 @@ class Connection:
 
     __command_handlers__ = {
         PacketCmd.Heartbeat       : _cmd_heartbeat,
+        PacketCmd.SystemStart     : _cmd_nop,
         PacketCmd.PushDeviceUID   : _cmd_push_device_uid,
         PacketCmd.RequestUSBState : _cmd_nop,
     }
 
     async def _keepalive(self):
-        while True:
-            fut = []
-            rssi = await self.repo.value(CameraSIID.Misc, CameraMiscPIID.RSSI, no_fetch = True)
+        while not self.mux.closed:
+            did = self.dev.tag.did
+            rssi = await self.props[CameraSIID.Misc, CameraMiscPIID.RSSI].read()
 
-            # report the subdev info
-            fut.append(self.rpc.send('_sync.subdev_upinfo',
-                did    = self.dev.tag.did,
-                fw_ver = CAM_VER,
-            ))
+            # send the keep-alive
+            try:
+                await self.rpc.send('_sync.subdev_keep_alive', {'did': did, 'rssi': rssi}, timeout = 1.0)
+            except TimeoutError:
+                self.log.warning('Keepalive timeout, try again.')
+                continue
 
-            # report the subdev keep-alive signal
-            fut.append(self.rpc.send('_sync.subdev_keep_alive', {
-                'did'  : self.dev.tag.did,
-                'rssi' : rssi,
-            }))
-
-            # mark the device as online
-            fut.append(self.rpc.send('properties_changed', {
-                'did'   : self.dev.tag.did,
-                'siid'  : CameraSIID.Misc,
-                'piid'  : CameraMiscPIID.Online,
-                'value' : True,
-            }))
-
-            # perform above actions concurrently
-            while fut and not self.mux.closed:
-                done, fut = await asyncio.wait(fut, timeout = 1.0)
-                errors = [f.exception() for f in done]
-
-                # check for exceptions in every completed futures
-                if any(isinstance(e, TimeoutError) for e in errors):
-                    self.log.warning('Keepalive timeout. Try again later.')
-                    break
-
-            # cancel remaining futures
-            for fut in fut:
-                fut.cancel()
-
-            # wait for 10 seconds
+            # wait for the next keep-alive
             for _ in range(10):
                 if not self.mux.closed:
                     await asyncio.sleep(1.0)
                 else:
-                    return
+                    break
 
     async def _handle_events(self):
         while True:
@@ -915,6 +710,18 @@ class Connection:
                     self.log.debug('Update COM_SEND channel to %s:%d.', addr, port)
                     self.tokens.update(port)
 
+    async def _handle_frames(self):
+        while True:
+            try:
+                rd = self.mux.reader(MuxType.UdpData)
+                req = await FrameSerdes.read(rd, self.dev.session_key)
+            except EOFError:
+                break
+
+            # TODO: this
+            if req.type == FrameCmd.Nested:
+                print(req)
+
     async def _handle_requests(self):
         while True:
             try:
@@ -940,11 +747,79 @@ class Connection:
                 self.log.debug('Unhandled command %s, dropped.', req.cmd)
 
     async def run(self):
-        await asyncio.wait([
-            asyncio.get_running_loop().create_task(self._keepalive()),
-            asyncio.get_running_loop().create_task(self._handle_events()),
-            asyncio.get_running_loop().create_task(self._handle_requests()),
-        ])
+        did = self.dev.tag.did
+        self.log.info('Camera is initializing ...')
+
+        # send the device information
+        while True:
+            try:
+                await self.rpc.send('_sync.subdev_upinfo', did = did, fw_ver = CAM_VER, timeout = 1.0)
+            except TimeoutError:
+                self.log.warning('State transition timeout, try again.')
+            else:
+                break
+
+        # mark the online state
+        await self.rpc.send('properties_changed', {
+            'did'   : did,
+            'siid'  : CameraSIID.Misc,
+            'piid'  : CameraMiscPIID.Online,
+            'value' : True,
+        })
+
+        # start all the tasks
+        fut = [
+            self._keepalive(),
+            self._handle_events(),
+            self._handle_frames(),
+            self._handle_requests(),
+        ]
+
+        # wait for them to complete
+        self.log.info('Camera is now online.')
+        await asyncio.gather(*fut)
+
+class Instance:
+    mac   : bytes
+    dev   : DeviceConfiguration
+    conn  : Optional[Connection]
+    props : Properties
+
+    def __init__(self, mac: bytes, dev: DeviceConfiguration):
+        self.mac   = mac
+        self.dev   = dev
+        self.conn  = None
+        self.props = Properties(
+            ValueProperty ( CameraSIID.Control       , CameraControlPIID.PowerSwitch   , True   ),
+            ValueProperty ( CameraSIID.Control       , CameraControlPIID.Flip          , 0      ),
+            ValueProperty ( CameraSIID.Control       , CameraControlPIID.NightVision   , 2      ),
+            ValueProperty ( CameraSIID.Control       , CameraControlPIID.OSDTimestamp  , True   ),
+            ValueProperty ( CameraSIID.Control       , CameraControlPIID.WDR           , True   ),
+            ValueProperty ( CameraSIID.Misc          , CameraMiscPIID.LED              , True   ),
+            ValueProperty ( CameraSIID.Misc          , CameraMiscPIID.LiveStream       , 0      ),
+            ValueProperty ( CameraSIID.Misc          , CameraMiscPIID.Distortion       , True   ),
+            ValueProperty ( CameraSIID.Misc          , CameraMiscPIID.BatteryLevel     , 0      ),
+            ValueProperty ( CameraSIID.Misc          , CameraMiscPIID.Resolution       , 0      ),
+            ValueProperty ( CameraSIID.Misc          , CameraMiscPIID.RSSI             , 0      ),
+            ValueProperty ( CameraSIID.Misc          , CameraMiscPIID.Online           , False  ),
+            ValueProperty ( CameraSIID.Misc          , CameraMiscPIID.PowerFreq        , 50     ),
+            ValueProperty ( CameraSIID.Misc          , CameraMiscPIID.BatteryVoltage   , 0      ),
+            ValueProperty ( CameraSIID.DetectionMisc , DetectionMiscPIID.RecordFreq    , 0      ),
+            ValueProperty ( CameraSIID.DetectionMisc , DetectionMiscPIID.RecordLimit   , 10     ),
+            ValueProperty ( CameraSIID.DetectionMisc , DetectionMiscPIID.Enabled       , True   ),
+            ValueProperty ( CameraSIID.Detection     , DetectionPIID.Enabled           , True   ),
+            ValueProperty ( CameraSIID.Detection     , DetectionPIID.RecordInterval    , 30     ),
+            ValueProperty ( CameraSIID.Detection     , DetectionPIID.RecordSensitivity , 100    ),
+            ValueProperty ( CameraSIID.OTA           , OTAPIID.Progress                , 100    ),
+            ValueProperty ( CameraSIID.OTA           , OTAPIID.State                   , 'idle' ),
+        )
+
+    @classmethod
+    def build(cls, cfg: Configuration) -> dict[bytes, 'Instance']:
+        return {
+            mac: cls(mac, dev)
+            for mac, dev in cfg.devices.items()
+        }
 
 class DeviceBinder:
     mac: bytes
@@ -986,7 +861,7 @@ class DeviceBinder:
             else:
                 self.log.debug('Dropping unexpected packet: %s', req)
 
-    async def _bind_device(self) -> DeviceConfiguration:
+    async def _bind_device(self) -> Instance:
         req = await self._wait_cmd(PacketCmd.ExchangeBindInfo)
         pkey, skid = struct.unpack('128s4xI4x', req.data[:140])
 
@@ -1092,9 +967,9 @@ class DeviceBinder:
 
         # bind successful
         self.log.info('Bind successful.')
-        return DeviceConfiguration(tag, mod, akey, StaticKey(skid), ekey)
+        return Instance(self.mac, DeviceConfiguration(tag, mod, akey, StaticKey(skid), ekey))
 
-    async def bind(self) -> DeviceConfiguration:
+    async def bind(self) -> Instance:
         try:
             return await self._bind_device()
         finally:
@@ -1104,7 +979,7 @@ class MWC11:
     log: Logger
     rpc: MiotRPC
     cfg: Configuration
-    cam: dict[bytes, Connection]
+    cam: dict[bytes, Instance]
 
     class EventListener(Connection.EventListener):
         cfg: Configuration
@@ -1116,15 +991,15 @@ class MWC11:
             self.cfg.save()
 
     def __init__(self, rpc: MiotRPC, cfg: Configuration):
-        self.cam = {}
         self.cfg = cfg
         self.rpc = rpc
         self.log = logging.getLogger('mwc11.station')
+        self.cam = Instance.build(cfg)
 
-    def find(self, did: str) -> Optional[Connection]:
-        for conn in self.cam.values():
-            if conn.dev.tag.did == did:
-                return conn
+    def find(self, did: str) -> Optional[Instance]:
+        for cam in self.cam.values():
+            if cam.dev.tag.did == did:
+                return cam
         else:
             return None
 
@@ -1146,21 +1021,16 @@ class MWC11:
         buf = await mux.reader(MuxType.StaInit).readexactly(14)
         mac, local, remote = struct.unpack('>6s4s4s', buf)
 
-        # check for MAC address
-        if mac in self.cam:
-            mux.close()
-            self.log.warning('Duplicated connection from "%s", dropped.', mac.hex(':'))
-            return
+        # find the camera instance
+        cam = self.cam.get(mac)
+        local = socket.inet_ntop(socket.AF_INET, local)
+        remote = socket.inet_ntop(socket.AF_INET, remote)
 
-        # find the session key
-        cfg = self.cfg
-        dev = cfg.devices.get(mac)
-
-        # bind the device if needed
-        if dev is None:
+        # check for MAC addressm
+        if cam is None:
             try:
-                dev = await DeviceBinder(mac, self.rpc, mux, cfg).bind()
-                cfg.add_device(mac, dev)
+                self.cam[mac] = cam = await DeviceBinder(mac, self.rpc, mux, self.cfg).bind()
+                self.cfg.add_device(mac, cam.dev)
             except ValueError as e:
                 mux.close()
                 self.log.error('Cannot register device "%s": %s', mac.hex(':'), e)
@@ -1170,31 +1040,44 @@ class MWC11:
                 self.log.error('Cannot register device "%s": timeout.', mac.hex(':'))
                 return
 
-        # parse the addresses
-        local = socket.inet_ntop(socket.AF_INET, local)
-        remote = socket.inet_ntop(socket.AF_INET, remote)
+        # check for duplicated connections
+        if cam.conn is not None:
+            mux.close()
+            self.log.warning('Duplicated connection from "%s", dropped.', mac.hex(':'))
+            return
 
         # create a new connection
         conn = Connection(
             mac            = mac,
             mux            = mux,
-            dev            = dev,
+            dev            = cam.dev,
             rpc            = self.rpc,
-            tokens         = SessionTokens(dev.session_key, local, remote),
+            props          = cam.props,
+            tokens         = SessionTokens(cam.dev.session_key, local, remote),
             event_listener = self.EventListener(self.cfg),
         )
 
-        # register the connection
-        self.cam[mac] = conn
+        # register the connection, and mark online
+        cam.conn = conn
+        cam.props[CameraSIID.Misc, CameraMiscPIID.Online] = True
         self.log.info('New connection from "%s".', mac.hex(':'))
 
         # serve the connection
         try:
             await conn.run()
         except Exception:
-            self.log.exception('Error when handling connection from "%s":', mac.hex(':'))
+            self.log.exception('Unhandled error from connection "%s":', mac.hex(':'))
         else:
             self.log.info('Connection from "%s" closed.', mac.hex(':'))
-        finally:
-            self.cam.pop(conn.mac, None)
-            mux.close()
+
+        # mark offline, unregister and close the connection
+        cam.props[CameraSIID.Misc, CameraMiscPIID.Online] = False
+        cam.conn = None
+        mux.close()
+
+async def main():
+    pass
+
+if __name__ == '__main__':
+    logs.setup()
+    asyncio.run(main())

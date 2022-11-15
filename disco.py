@@ -3,260 +3,50 @@
 
 import os
 import json
-import time
 import base64
-import struct
 import logging
-import hashlib
 import asyncio
 import argparse
-import binascii
 import coloredlogs
 
 from udp import UdpSocket
-from enum import IntEnum
-from urllib import parse
 from logging import Logger
 
-from miot import Payload
-from miot import RPCError
-from miot import RPCRequest
-from miot import RPCResponse
-from miot import SignSuite
-
 from typing import Any
-from typing import Callable
 from typing import Optional
-from typing import Sequence
 from typing import NamedTuple
 
-from cryptography.hazmat.primitives.hmac import HMAC
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.constant_time import bytes_eq
-
-from cryptography.hazmat.primitives.ciphers import Cipher
-from cryptography.hazmat.primitives.ciphers.modes import CBC
-from cryptography.hazmat.primitives.ciphers.algorithms import AES128
 
 from cryptography.hazmat.primitives.asymmetric.ec import ECDH
-from cryptography.hazmat.primitives.asymmetric.ec import SECP256R1
-from cryptography.hazmat.primitives.asymmetric.ec import SECP384R1
 from cryptography.hazmat.primitives.asymmetric.ec import generate_private_key
 from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey
 
 from cryptography.hazmat.primitives._serialization import Encoding
 from cryptography.hazmat.primitives._serialization import PublicFormat
 
-from mwc1x import MACAddress
+from miio import Key
+from miio import Pin
+from miio import Packet
+from miio import Payload
+from miio import DeviceInfo
+
+from miio import RPCError
+from miio import RPCRequest
+from miio import RPCResponse
+
+from miio import PinMode
+from miio import SignSuite
+from miio import CurveSuite
+from miio import PacketType
+
 from mwc1x import Configuration
 from mwc1x import ApConfiguration
 from mwc1x import StationConfiguration
 
 LOG_FMT      = '%(asctime)s %(name)s [%(levelname)s] %(message)s'
 LOG_LEVEL    = logging.DEBUG
-
-HEADER_SIZE  = 32
-HEADER_MAGIC = 0x2131
-
-class Seq:
-    @staticmethod
-    def foreach(func: Callable[[bytes], None], seq: Sequence[bytes]):
-        for v in seq:
-            func(v)
-
-class PinMode(IntEnum):
-    Unknown1    = 1
-    RandomInt   = 2
-    UniqueToken = 3
-    Unknown4    = 4
-
-class Pin:
-    oob  : bytes
-    mode : PinMode
-
-    def __init__(self, mode: PinMode, oob: bytes = b''):
-        self.oob = oob
-        self.mode = mode
-
-    @classmethod
-    def random(cls) -> 'Pin':
-        return cls(PinMode.RandomInt, os.urandom(4))
-
-    @classmethod
-    def from_oob(cls, oob: bytes) -> 'Pin':
-        return cls(PinMode.UniqueToken, oob)
-
-class Key:
-    iv    : bytes
-    key   : bytes
-    token : bytes
-
-    def __init__(self, iv: bytes, key: bytes, token: bytes):
-        self.iv    = iv
-        self.key   = key
-        self.token = token
-
-    def __repr__(self) -> str:
-        return '\n'.join([
-            'Key {',
-            '    iv    = ' + self.iv.hex(),
-            '    key   = ' + self.key.hex(),
-            '    token = ' + self.token.hex(),
-            '}',
-        ])
-
-    def sign(self, *data: bytes) -> bytes:
-        hmac = HMAC(self.key, SHA256())
-        Seq.foreach(hmac.update, data)
-        return hmac.finalize()
-
-    def verify(self, sign: bytes, *data: bytes) -> bool:
-        return bytes_eq(sign, self.sign(*data))
-
-    def encrypt(self, data: bytes) -> bytes:
-        pad = 16 - (len(data) % 16)
-        aes = Cipher(AES128(self.key), CBC(self.iv)).encryptor()
-        return aes.update(data) + aes.update(bytes([pad] * pad)) + aes.finalize()
-
-    def decrypt(self, data: bytes) -> bytes:
-        aes = Cipher(AES128(self.key), CBC(self.iv)).decryptor()
-        buf = aes.update(data) + aes.finalize()
-        return buf[:-buf[-1]]
-
-    @classmethod
-    def empty(cls) -> 'Key':
-        return cls(b'', b'', b'')
-
-    @classmethod
-    def from_token(cls, token: bytes) -> 'Key':
-        key = hashlib.md5(token).digest()
-        return cls(hashlib.md5(key + token).digest(), key, token)
-
-class PacketType(IntEnum):
-    RPC         = 1
-    Probe       = 2
-    Keepalive   = 3
-
-class Packet:
-    t0    : float = time.time()
-    ts    : int
-    did   : int
-    data  : Optional[Payload]
-    type  : PacketType
-    token : bytes
-
-    def __init__(self, ts: int, did: int, data: Optional[Payload], type: PacketType, token: bytes):
-        self.ts    = ts
-        self.did   = did
-        self.data  = data
-        self.type  = type
-        self.token = token
-
-    def __repr__(self) -> str:
-        return ''.join([
-            'Packet {\n',
-            '    type  = %s\n' % self.type,
-            self.ts  != -1 and '    ts    = %d\n' % self.ts or '',
-            self.did != -1 and '    did   = %d\n' % self.did or '',
-            self.token     and '    token = %s\n' % self.token.hex() or '',
-            self.data      and '    data  = %s\n' % ('\n' + ' ' * 4).join(str(self.data).splitlines()) or '',
-            '}',
-        ])
-
-    def to_bytes(self, key: Key) -> bytes:
-        ty = self.type
-        data = self.data
-
-        # encrypt the body if needed
-        if data is None:
-            if ty == PacketType.RPC:
-                raise ValueError('%s packet must have a body' % ty.name)
-            else:
-                out = b''
-        else:
-            if ty != PacketType.RPC:
-                raise ValueError('%s packet does not have body' % ty.name)
-            else:
-                out = key.encrypt(data.to_bytes())
-
-        # pack the header
-        nb = len(out) + HEADER_SIZE
-        buf = bytearray(struct.pack('>HHqi16s', HEADER_MAGIC, nb, self.did, self.ts, key.token) + out)
-
-        # special case of the probe packet
-        if ty == PacketType.Probe:
-            cksum = self.token
-        else:
-            cksum = hashlib.md5(buf).digest()
-
-        # update the checksum field
-        struct.pack_into('16s', buf, 16, cksum)
-        return bytes(buf)
-
-    @classmethod
-    def parse(cls, key: Key, data: bytes) -> 'Packet':
-        hdr = data[:HEADER_SIZE]
-        magic, size, did, ts, cksum = struct.unpack('>HHqi16s', hdr)
-
-        # check packet magic
-        if magic != HEADER_MAGIC:
-            raise ValueError('invalid packet magic')
-
-        # check for packet length
-        if size != len(data):
-            raise ValueError('incorrect packet length')
-
-        # determain packet type
-        if size != HEADER_SIZE:
-            ty = PacketType.RPC
-        elif did == -1:
-            ty = PacketType.Probe
-        else:
-            ty = PacketType.Keepalive
-
-        # probe packet does not have checksum
-        if ty == PacketType.Probe:
-            return Packet(ts, did, b'', ty, cksum)
-
-        # calculate the checksum
-        md5 = hashlib.md5(data[:HEADER_SIZE - 16])
-        md5.update(key.token)
-        md5.update(data[HEADER_SIZE:])
-
-        # verify the checksum
-        if cksum != md5.digest():
-            raise ValueError('%s packet checksum mismatch: %s != %s' % (ty.name, cksum.hex(), md5.hexdigest()))
-
-        # no payload data
-        if ty == PacketType.Keepalive:
-            return cls(ts, did, b'', ty, cksum)
-
-        # decrypt and parse the payload
-        data = key.decrypt(data[HEADER_SIZE:])
-        return cls(ts, did, RPCRequest.from_bytes(data), ty, cksum)
-
-    @classmethod
-    def now(cls) -> int:
-        return int((time.time() - cls.t0) * 1000)
-
-    @classmethod
-    def rpc(cls, did: int, data: Payload) -> 'Packet':
-        return cls(cls.now(), did, data, PacketType.RPC, b'')
-
-    @classmethod
-    def probe_ack(cls, did: int, token: bytes) -> 'Packet':
-        return cls(cls.now(), did, None, PacketType.Probe, token)
-
-class CurveSuite(IntEnum):
-    SECP256R1   = 3
-    SECP384R1   = 4
-
-    def to_ec_curve(self):
-        match self:
-            case self.SECP256R1 : return SECP256R1()
-            case self.SECP384R1 : return SECP384R1()
-            case _              : raise RuntimeError('unreachable')
 
 class Handshake:
     key   : Key
@@ -499,22 +289,17 @@ class RPCHandler:
     }
 
 class Discovery:
-    did: int
-    key: Key
-    pin: Pin
-    mac: bytes
     log: Logger
     rpc: RPCHandler
+    dev: DeviceInfo
 
-    def __init__(self, did: int, mac: bytes, key: Key, pin: Pin):
-        self.did = did
-        self.key = key
-        self.pin = pin
-        self.mac = mac
-        self.rpc = RPCHandler(pin, key.token)
+    def __init__(self, dev: DeviceInfo):
+        self.dev = dev
         self.log = logging.getLogger('disco')
+        self.rpc = RPCHandler(dev.pin, dev.key.token)
 
     async def run(self) -> Configuration:
+        repo = Packet.Gen()
         sock = await UdpSocket.new(('0.0.0.0', 54321))
         self.log.info('Discovery is now listening at port 54321')
 
@@ -525,7 +310,7 @@ class Discovery:
 
             # attempt to parse the request
             try:
-                req = Packet.parse(self.key, rbuf)
+                req = repo.parse(rbuf, key = self.dev.key)
             except Exception:
                 self.log.exception('Cannot parse the request:')
                 continue
@@ -536,10 +321,10 @@ class Discovery:
             match req.type:
                 case PacketType.RPC:
                     resp = await self.rpc.handle_request(req.data)
-                    resp = resp and Packet.rpc(self.did, resp)
+                    resp = resp and repo.rpc(self.dev.did, resp)
                 case PacketType.Probe:
                     self.rpc.hs.reset()
-                    resp = Packet.probe_ack(self.did, self.key.token)
+                    resp = repo.probe_ack(self.dev.did, self.dev.key.token)
                 case PacketType.Keepalive:
                     self.log.debug('Keepalive from client.')
                 case _:
@@ -547,7 +332,7 @@ class Discovery:
 
             # send response if any
             if resp is not None:
-                sock.sendto(resp.to_bytes(self.key), addr)
+                sock.sendto(resp.to_bytes(self.dev.key), addr)
                 self.log.debug('Transmitted packet: %r', resp)
 
         # close the socket
@@ -561,46 +346,14 @@ class Discovery:
                 passwd = self.rpc.cfg.passwd,
             ),
             station = StationConfiguration(
-                did      = self.did,
+                did      = self.dev.did,
                 uid      = self.rpc.cfg.uid,
-                mac      = self.mac,
-                oob      = self.pin.oob,
-                token    = self.key.token,
+                mac      = self.dev.mac,
+                oob      = self.dev.pin.oob,
+                token    = self.dev.key.token,
                 bind_key = self.rpc.cfg.bind_key.encode('utf-8'),
             ),
         )
-
-    @classmethod
-    async def discover(cls, url: str, *, token: bytes = b'') -> Configuration:
-        url = parse.urlparse(url)
-        query = parse.parse_qs(url.query)
-
-        # check for device identification URL
-        if url.scheme != 'https' or url.netloc != 'home.mi.com' or url.path != '/do/home.html':
-            raise ValueError('not a valid device identification URL')
-
-        # everything must appear exactly once
-        for val in query.values():
-            if len(val) != 1:
-                raise ValueError('not a valid device identification URL')
-
-        # extract the URL parts
-        try:
-            did = int(query['d'][0])
-            mac = str(query['m'][0]).lower()
-            oob = str(query['O'][0]).encode('utf-8')
-        except (KeyError, ValueError):
-            raise ValueError('not a valid device identification URL') from None
-
-        # generate a random token if needed
-        if not token:
-            token = base64.b64encode(os.urandom(12))
-
-        # start the discovery
-        pin = Pin.from_oob(oob)
-        key = Key.from_token(token)
-        mac = MACAddress.parse(mac)
-        return await cls(did, mac, key, pin).run()
 
 async def main():
     p = argparse.ArgumentParser()
@@ -609,7 +362,7 @@ async def main():
 
     # start the discovery
     ns = p.parse_args()
-    cfg = await Discovery.discover(ns.url)
+    cfg = await Discovery(DeviceInfo.parse(ns.url)).run()
 
     # dump the configuration before saving to avoid destroying the old config
     data = json.dumps(

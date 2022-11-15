@@ -24,12 +24,7 @@ from functools import cached_property
 from ssl import SSLContext
 from ssl import DER_cert_to_PEM_cert
 
-from mjac import MJAC
-from mjac import Zone
-
 from typing import Any
-from typing import Type
-from typing import Union
 from typing import Optional
 from typing import Sequence
 
@@ -38,175 +33,20 @@ from asyncio import TimerHandle
 from asyncio import StreamReader
 from asyncio import StreamWriter
 
+from mjac import MJAC
+from mjac import Zone
+
+from miio import Payload
+from miio import SignSuite
+
+from miio import RPCError
+from miio import RPCRequest
+from miio import RPCResponse
+
 HEADER_SIZE         = 8
-REQUEST_TIMEOUT     = 5
+REQUEST_TIMEOUT     = 3
 TIMESYNC_INTERVAL   = 30
 HEARTBEAT_INTERVAL  = 10
-
-class Payload:
-    def to_bytes(self) -> bytes:
-        raise NotImplementedError
-
-    @classmethod
-    def from_bytes(cls, _: bytes) -> 'Payload':
-        raise NotImplementedError
-
-    @staticmethod
-    def type_checked(v: Any, ty: Type) -> Any:
-        if not isinstance(v, ty):
-            raise ValueError('invalid type: expect %r, got %r' % (ty, type(v)))
-        else:
-            return v
-
-class RPCError(Exception):
-    code    : int
-    data    : Any
-    message : str
-
-    class Code(IntEnum):
-        NoSuchProperty      = -4003
-        InvalidParameters   = -32602
-
-    def __init__(self, code: int, message: str, *, data: Any = None):
-        self.code    = code
-        self.data    = data
-        self.message = message
-
-    def __str__(self) -> str:
-        if self.data is None:
-            return '[error %d] %s' % (self.code, self.message)
-        else:
-            return '[error %d] %s: %r' % (self.code, self.message, self.data)
-
-    def to_dict(self) -> dict[str, Any]:
-        if self.data is None:
-            return { 'code': self.code, 'message': self.message }
-        else:
-            return { 'code': self.code, 'message': self.message, 'data': self.data }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> 'RPCError':
-        code = Payload.type_checked(data['code'], int)
-        message = Payload.type_checked(data['message'], str)
-        return cls(code, message, data = data.get('data'))
-
-class RPCRequest(Payload):
-    id     : Optional[int]
-    args   : Union[Sequence, dict[str, Any]]
-    method : str
-
-    def __init__(self, method: str, *, id: Optional[int] = None, args: Union[None, Sequence, dict[str, Any]] = None):
-        self.id     = id
-        self.args   = args or {}
-        self.method = method
-
-    @property
-    def _readable_args(self) -> str:
-        return ('\n' + ' ' * 4).join(json.dumps(self.args, indent = 4, sort_keys = True).splitlines())
-
-    def __repr__(self) -> str:
-        return '\n'.join([
-            'RPCRequest {',
-            '    id     = %d' % self.id,
-            '    method = %s' % self.method,
-            '    args   = %s' % self._readable_args,
-            '}',
-        ])
-
-    def to_json(self) -> str:
-        return json.dumps(
-            separators = (',', ':'),
-            obj        = {
-                k: v
-                for k, v in (
-                    ( 'id'     , self.id           ),
-                    ( 'method' , self.method       ),
-                    ( 'params' , self.args or None ),
-                )
-                if v is not None
-            }
-        )
-
-    def to_bytes(self) -> bytes:
-        return self.to_json().encode('utf-8')
-
-    @classmethod
-    def from_json(cls, data: str) -> 'RPCRequest':
-        obj = json.loads(data)
-        rid = Payload.type_checked(obj.get('id', None), (int, None))
-        args = Payload.type_checked(obj.get('params', {}), (str, list, dict))
-        method = Payload.type_checked(obj['method'], str)
-
-        # handle the special case of an empty string
-        if not isinstance(args, str):
-            return cls(method, id = rid, args = args)
-        elif args == '':
-            return cls(method, id = rid)
-        else:
-            raise ValueError('invalid parameter type: must be list or dict')
-
-    @classmethod
-    def from_bytes(cls, data: bytes) -> 'RPCRequest':
-        return cls.from_json(data.rstrip(b'\x00').decode('utf-8'))
-
-class RPCResponse(Payload):
-    id    : int
-    data  : Any
-    error : Optional[RPCError]
-
-    def __init__(self, id: int, *, data: Any = None, error: Optional[RPCError] = None):
-        self.id    = id
-        self.data  = data
-        self.error = error
-
-    @property
-    def _readable_data(self) -> str:
-        return ('\n' + ' ' * 4).join(json.dumps(self.data, indent = 4, sort_keys = True).splitlines())
-
-    def __repr__(self) -> str:
-        return ''.join([
-            'RPCResponse {\n',
-            '    id    = %d\n' % self.id,
-            self.data and '    data  = %s\n' % self._readable_data or '',
-            self.error and '    error = %s\n' % self.error or '',
-            '}',
-        ])
-
-    def to_json(self) -> str:
-        return json.dumps(
-            separators = (',', ':'),
-            obj        = {
-                k: v
-                for k, v in (
-                    ( 'id'     , self.id   ),
-                    ( 'result' , self.data or None ),
-                    ( 'error'  , self.error and {
-                        kk: vv
-                        for kk, vv in (
-                            ( 'code'    , self.error.code    ),
-                            ( 'data'    , self.error.data    ),
-                            ( 'message' , self.error.message ),
-                        )
-                        if vv is not None
-                    }),
-                )
-                if v is not None
-            }
-        )
-
-    def to_bytes(self) -> bytes:
-        return self.to_json().encode('utf-8')
-
-    @classmethod
-    def from_json(cls, data: str) -> 'RPCRequest':
-        obj = json.loads(data)
-        rid = Payload.type_checked(obj['id'], int)
-        error = Payload.type_checked(obj.get('error', {}), dict)
-        return cls(rid, data = obj.get('result'), error = error and RPCError.from_dict(error) or None)
-
-    @classmethod
-    def from_bytes(cls, data: bytes) -> 'RPCRequest':
-        return cls.from_json(data.rstrip(b'\x00').decode('utf-8'))
 
 class SyncRequest(Payload):
     uptime: int
@@ -244,11 +84,6 @@ class SyncResponse(Payload):
         unk, utc_ms = struct.unpack('>QQ', data)
         return SyncResponse(unk, utc_ms)
 
-class SignSuite(IntEnum):
-    Invalid = 0
-    HMAC    = 1
-    MJAC    = 2
-
 class LoginRequest(Payload):
     did  : int
     cert : str
@@ -278,10 +113,10 @@ class LoginRequest(Payload):
         return ''.join([
             'Login {\n',
             '    did  = %d\n' % self.did,
-            self.algo and '    algo = %s\n' % ', '.join(map(str, self.algo)) or '',
-            self.rand and '    rand = %s\n' % self.rand or '',
-            self.sign and '    sign = %s\n' % self.sign.hex() or '',
-            self.cert and '    cert = %s\n' % ('\n' + ' ' * 11).join(str(self.cert).splitlines()),
+            '    algo = %s\n' % ', '.join(map(str, self.algo)) if self.algo else '',
+            '    rand = %s\n' % self.rand if self.rand else '',
+            '    sign = %s\n' % self.sign.hex() if self.sign else '',
+            '    cert = %s\n' % ('\n' + ' ' * 11).join(str(self.cert).splitlines()) if self.cert else '',
             '}',
         ])
 
@@ -327,8 +162,8 @@ class LoginStatus(IntEnum):
 class LoginResponse(Payload):
     msg  : str
     rand : str
-    code : LoginStatus
     algo : SignSuite
+    code : LoginStatus
 
     def __init__(self, code: LoginStatus, msg: str, algo: SignSuite, rand: str):
         self.msg  = msg
@@ -339,10 +174,10 @@ class LoginResponse(Payload):
     def __repr__(self) -> str:
         return '\n'.join([
             'LoginAck {',
-            '    code = %s' % ('(n/a)' if self.code == LoginStatus.NoCode else self.code),
-            '    msg  = %s' % repr(self.msg),
-            '    algo = %s' % ('(n/a)' if self.algo == SignSuite.Invalid else self.algo),
-            '    rand = %s' % (self.rand or '(empty)'),
+            '    code      = %s' % ('(n/a)' if self.code == LoginStatus.NoCode else self.code),
+            '    message   = %s' % repr(self.msg),
+            '    algorithm = %s' % ('(n/a)' if self.algo == SignSuite.Invalid else self.algo),
+            '    randdom   = %s' % (self.rand or '(empty)'),
             '}',
         ])
 
@@ -625,10 +460,10 @@ class MiotRPC:
             fut, _ = self.waiter.pop(pid)
             fut.cancelled() or fut.set_exception(TimeoutError)
 
-    def _send_request(self, req: RPCRequest) -> Future[RPCResponse]:
+    def _send_request(self, req: RPCRequest, timeout: float = REQUEST_TIMEOUT) -> Future[RPCResponse]:
         snd = self.sender()
         fut = asyncio.get_running_loop().create_future()
-        tmr = asyncio.get_running_loop().call_later(REQUEST_TIMEOUT, self._fire_timeout, req.id)
+        tmr = asyncio.get_running_loop().call_later(timeout, self._fire_timeout, req.id)
         self.waiter[req.id] = (fut, tmr)
         snd.send_packet(Packet.request(snd.next_seq(), req))
         fut.add_done_callback(lambda _: self._drop_timer(req.id))
@@ -639,17 +474,17 @@ class MiotRPC:
         if fut.done() and not fut.cancelled() and fut.exception() is None:
             fut.result().id = rid
 
-    def send(self, method: str, *args, **kwargs) -> Future[RPCResponse]:
+    def send(self, method: str, *args, timeout: float = REQUEST_TIMEOUT, **kwargs) -> Future[RPCResponse]:
         if args and kwargs:
             raise ValueError('args and kwargs cannot be present at the same time')
         else:
-            return self._send_request(RPCRequest(method, id = self._next_id(), args = args or kwargs))
+            return self._send_request(RPCRequest(method, id = self._next_id(), args = args or kwargs), timeout)
 
-    def proxy(self, req: RPCRequest) -> Future[RPCResponse]:
+    def proxy(self, req: RPCRequest, *, timeout: float = REQUEST_TIMEOUT) -> Future[RPCResponse]:
         if req.id not in self.waiter:
             return self._send_request(req)
         else:
-            ret = self._send_request(RPCRequest(req.method, id = self._next_id(), args = req.args))
+            ret = self._send_request(RPCRequest(req.method, id = self._next_id(), args = req.args), timeout)
             ret.add_done_callback(lambda f: self._update_request_id(f, req.id))
             return ret
 
@@ -794,14 +629,9 @@ class MiotConnection(Sender):
             self.log.debug('Keep alive.')
             self.send_packet(Packet.keepalive(self.next_seq()))
 
-    async def _login_poller(self):
-        while True:
+    async def _login_handler(self):
+        while self.state != 'online':
             match self.state:
-                case 'idle':
-                    await asyncio.sleep(1)
-                case 'online':
-                    self.state = 'idle'
-                    asyncio.get_running_loop().create_task(self.app.device_ready())
                 case 'login_1':
                     self.state = 'wait_login_1'
                     self.log.debug('Login sequence stage 1.')
@@ -861,20 +691,41 @@ class MiotConnection(Sender):
 
     async def _network_receiver(self):
         while True:
-            p = await Packet.read_from(self.rd)
-            self.log.debug('Received %s packet with Seq %d.', p.ty.name, p.seq)
-            await self._network_handler(p)
+            try:
+                p = await Packet.read_from(self.rd)
+            except EOFError:
+                break
+            else:
+                self.log.debug('Received %s packet with Seq %d.', p.ty.name, p.seq)
+                await self._network_handler(p)
 
     async def run_forever(self):
-        await asyncio.wait(
-            return_when = asyncio.FIRST_COMPLETED,
-            fs          = [
-                asyncio.ensure_future(self._timesync()),
-                asyncio.ensure_future(self._heartbeat()),
-                asyncio.ensure_future(self._login_poller()),
-                asyncio.ensure_future(self._network_receiver()),
-            ],
-        )
+        tms = asyncio.get_running_loop().create_task(self._timesync())
+        hrt = asyncio.get_running_loop().create_task(self._heartbeat())
+        net = asyncio.get_running_loop().create_task(self._network_receiver())
+
+        # start the login sequence
+        try:
+            await self._login_handler()
+        except Exception:
+            self.log.exception('Errors occured in the login sequence:')
+
+        # start the app if online
+        if self.state == 'online':
+            try:
+                await self.app.device_ready()
+            except Exception:
+                self.log.exception('Unhandled exception in application:')
+
+        # close the connection
+        self.wr.close()
+        self.rd.feed_eof()
+        self.log.info('Shutting down ...')
+
+        # stop the tasks
+        tms.cancel()
+        hrt.cancel()
+        net.cancel()
 
 class MiotAppLoader:
     __providers__ = {

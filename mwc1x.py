@@ -7,7 +7,6 @@ import base64
 import socket
 import struct
 import hashlib
-import binascii
 
 from typing import Any, Optional
 from functools import cached_property
@@ -16,19 +15,8 @@ from cryptography.hazmat.primitives.ciphers import Cipher
 from cryptography.hazmat.primitives.ciphers.modes import CBC
 from cryptography.hazmat.primitives.ciphers.algorithms import AES128
 
-from miot import Payload
-
-class MACAddress:
-    @staticmethod
-    def parse(mac: str) -> bytes:
-        return MACAddress.validated(binascii.unhexlify(mac.replace(':', '')))
-
-    @staticmethod
-    def validated(mac: bytes) -> bytes:
-        if len(mac) != 6:
-            raise ValueError('invalid mac address: ' + mac.hex(':'))
-        else:
-            return mac
+from miio import Payload
+from miio import MACAddress
 
 class EventListener:
     def save_config(self, cfg: dict[str, Any]):

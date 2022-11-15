@@ -29,14 +29,16 @@ from cryptography.hazmat.primitives.asymmetric.ec import SECP256R1
 from cryptography.hazmat.primitives.asymmetric.ec import generate_private_key
 from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey
 
-from miot import Payload
-from miot import RPCError
-from miot import RPCRequest
-from miot import RPCResponse
+from miio import Payload
+from miio import RPCError
+from miio import RPCRequest
+from miio import RPCResponse
 
 from miot import MiotRPC
 from miot import MiotApplication
 from miot import MiotConfiguration
+
+from miss import MissServer
 
 from mwc11 import MWC11
 from mwc11 import STATION_BIND
@@ -48,7 +50,7 @@ from props import SIID
 from props import PIID
 from props import Property
 from props import Properties
-from props import ConstProperty
+from props import ValueProperty
 
 from props import OTAPIID
 from props import StationSIID
@@ -64,10 +66,14 @@ DEVICE_MODEL = 'mxiang.camera.mwc10'
 
 class MiotApp(MiotApplication):
     did    : int
+    run    : bool
     cam    : MWC11
     log    : Logger
     rpc    : MiotRPC
     cfg    : Configuration
+    bind   : str
+    port   : int
+    miss   : MissServer
     props  : Properties
     uptime : int
 
@@ -106,39 +112,39 @@ class MiotApp(MiotApplication):
 
         # initialize the application
         self.rpc    = rpc
+        self.run    = True
         self.cfg    = ConfigurationFile.load(fn)
         self.cam    = MWC11(rpc, self.cfg)
         self.did    = cfg.security_provider.device_id
         self.log    = logging.getLogger('mwc10')
+        self.bind   = bind
+        self.port   = port
+        self.miss   = MissServer(rpc, self.cfg.station.bind_key)
         self.uptime = cfg.uptime
 
         # initialize all const properties
         self.props = Properties(
-            ConstProperty ( StationSIID.CameraControl  , CameraControlPIID.PowerSwitch     , True   ),
-            ConstProperty ( StationSIID.CameraControl  , CameraControlPIID.Flip            , 0      ),
-            ConstProperty ( StationSIID.CameraControl  , CameraControlPIID.NightVision     , 2      ),
-            ConstProperty ( StationSIID.CameraControl  , CameraControlPIID.OSDTimestamp    , True   ),
-            ConstProperty ( StationSIID.CameraControl  , CameraControlPIID.WDR             , True   ),
-            ConstProperty ( StationSIID.StorageSD      , StoragePIID.Enabled               , False  ),
-            ConstProperty ( StationSIID.StorageSD      , StoragePIID.TotalSize             , 0      ),
-            ConstProperty ( StationSIID.StorageSD      , StoragePIID.FreeSize              , 0      ),
-            ConstProperty ( StationSIID.StorageSD      , StoragePIID.UsedSize              , 0      ),
-            ConstProperty ( StationSIID.StorageSD      , StoragePIID.Status                , 0      ),
-            ConstProperty ( StationSIID.StorageUSB     , StoragePIID.Enabled               , False  ),
-            ConstProperty ( StationSIID.StorageUSB     , StoragePIID.TotalSize             , 0      ),
-            ConstProperty ( StationSIID.StorageUSB     , StoragePIID.FreeSize              , 0      ),
-            ConstProperty ( StationSIID.StorageUSB     , StoragePIID.UsedSize              , 0      ),
-            ConstProperty ( StationSIID.StorageUSB     , StoragePIID.Status                , 0      ),
-            ConstProperty ( StationSIID.StorageControl , StorageControlPIID.StorageSwitch  , True   ),
-            ConstProperty ( StationSIID.StorageControl , StorageControlPIID.Type           , 0      ),
-            ConstProperty ( StationSIID.StorageControl , StorageControlPIID.LightIndicator , True   ),
-            ConstProperty ( StationSIID.OTA            , OTAPIID.Progress                  , 100    ),
-            ConstProperty ( StationSIID.OTA            , OTAPIID.State                     , 'idle' ),
+            ValueProperty ( StationSIID.CameraControl  , CameraControlPIID.PowerSwitch     , True   ),
+            ValueProperty ( StationSIID.CameraControl  , CameraControlPIID.Flip            , 0      ),
+            ValueProperty ( StationSIID.CameraControl  , CameraControlPIID.NightVision     , 2      ),
+            ValueProperty ( StationSIID.CameraControl  , CameraControlPIID.OSDTimestamp    , True   ),
+            ValueProperty ( StationSIID.CameraControl  , CameraControlPIID.WDR             , True   ),
+            ValueProperty ( StationSIID.StorageSD      , StoragePIID.Enabled               , False  ),
+            ValueProperty ( StationSIID.StorageSD      , StoragePIID.TotalSize             , 0      ),
+            ValueProperty ( StationSIID.StorageSD      , StoragePIID.FreeSize              , 0      ),
+            ValueProperty ( StationSIID.StorageSD      , StoragePIID.UsedSize              , 0      ),
+            ValueProperty ( StationSIID.StorageSD      , StoragePIID.Status                , 0      ),
+            ValueProperty ( StationSIID.StorageUSB     , StoragePIID.Enabled               , False  ),
+            ValueProperty ( StationSIID.StorageUSB     , StoragePIID.TotalSize             , 0      ),
+            ValueProperty ( StationSIID.StorageUSB     , StoragePIID.FreeSize              , 0      ),
+            ValueProperty ( StationSIID.StorageUSB     , StoragePIID.UsedSize              , 0      ),
+            ValueProperty ( StationSIID.StorageUSB     , StoragePIID.Status                , 0      ),
+            ValueProperty ( StationSIID.StorageControl , StorageControlPIID.StorageSwitch  , True   ),
+            ValueProperty ( StationSIID.StorageControl , StorageControlPIID.Type           , 0      ),
+            ValueProperty ( StationSIID.StorageControl , StorageControlPIID.LightIndicator , True   ),
+            ValueProperty ( StationSIID.OTA            , OTAPIID.Progress                  , 100    ),
+            ValueProperty ( StationSIID.OTA            , OTAPIID.State                     , 'idle' ),
         )
-
-        # start the MWC11 client
-        loop = asyncio.get_running_loop()
-        loop.create_task(self.cam.serve_forever(bind, port))
 
     @classmethod
     def device_model(cls) -> str:
@@ -158,51 +164,83 @@ class MiotApp(MiotApplication):
         self.rpc.reply_to(p, data = data, error = error)
 
     async def _stats(self):
-        await asyncio.wait([
-            self.rpc.send('props', ota_state = 'idle'),
-            self.rpc.send('_async.stat',
-                model           = DEVICE_MODEL,
-                fw_ver          = FW_VER,
-                miio_client_ver = MIIO_CLI_VER,
-                **{
-                    'miot.sc_type': {
-                        'device_sc_type': [16],
-                        'user_sc_type': -1,
-                    },
-                }
-            ),
-            self.rpc.send('_otc.info',
-                life            = int(time.monotonic() - self.uptime),
-                uid             = self.cfg.station.uid,
-                model           = DEVICE_MODEL,
-                token           = self.cfg.station.bind_key.hex(),
-                ipflag          = 1,
-                miio_ver        = MIIO_VER,
-                mac             = self.cfg.station.mac.hex().upper(),
-                fw_ver          = FW_VER,
-                hw_ver          = HW_VER,
-                miio_client_ver = MIIO_CLI_VER,
-                VmPeak          = 0,
-                VmRSS           = 0,
-                MemFree         = 0,
-                miio_times      = [0, 0, 0, 0],
-                netif           = self._net_info(),
-                ap              = {
-                    'ssid'  : self.cfg.ap.ssid,
-                    'bssid' : '11:22:33:44:55:66',
-                    'rssi'  : '-40',
-                    'freq'  : 2412,
-                },
-            ),
-        ])
+        for _ in range(3):
+            if not self.run:
+                return
+            else:
+                try:
+                    await asyncio.gather(
+                        self.rpc.send('props', ota_state = 'idle'),
+                        self.rpc.send('_async.stat',
+                            model           = DEVICE_MODEL,
+                            fw_ver          = FW_VER,
+                            miio_client_ver = MIIO_CLI_VER,
+                            **{
+                                'miot.sc_type': {
+                                    'device_sc_type': [16],
+                                    'user_sc_type': -1,
+                                },
+                            }
+                        ),
+                        self.rpc.send('_otc.info',
+                            life            = int(time.monotonic() - self.uptime),
+                            uid             = self.cfg.station.uid,
+                            model           = DEVICE_MODEL,
+                            token           = self.cfg.station.bind_key.hex(),
+                            ipflag          = 1,
+                            miio_ver        = MIIO_VER,
+                            mac             = self.cfg.station.mac.hex().upper(),
+                            fw_ver          = FW_VER,
+                            hw_ver          = HW_VER,
+                            miio_client_ver = MIIO_CLI_VER,
+                            VmPeak          = 0,
+                            VmRSS           = 0,
+                            MemFree         = 0,
+                            miio_times      = [0, 0, 0, 0],
+                            netif           = self._net_info(),
+                            ap              = {
+                                'ssid'  : self.cfg.ap.ssid,
+                                'bssid' : '11:22:33:44:55:66',
+                                'rssi'  : '-40',
+                                'freq'  : 2412,
+                            },
+                        ),
+                    )
+                except TimeoutError:
+                    self.log.warning('Keep-alive timeout, try again.')
+                except Exception:
+                    self.log.exception('Unhandled error when performing keep-alive, try again later.')
+                    return
+                else:
+                    break
+        else:
+            self.log.error('Keep-alive failed after 3 attempts, try again later.')
+
+    async def _keepalive(self):
+        while self.run:
+            for i in range(31):
+                if i == 0:
+                    await self._stats()
+                elif self.run:
+                    await asyncio.sleep(1.0)
+                else:
+                    break
 
     async def device_ready(self):
+        port = self.port
+        bind = self.bind
+        task = asyncio.get_running_loop().create_task(self._keepalive())
+
+        # perform the handshake, and start the application
         try:
-            while True:
-                await self._stats()
-                await asyncio.sleep(30.0)
+            if await self.miss.handshake():
+                await self.cam.serve_forever(bind, port)
         except Exception:
-            self.log.exception('Unhandled exception when reporting stats:')
+            self.log.exception('Error when handling requests:')
+
+        # wait for keep-alive to stop
+        self.run = False
+        await task
 
     async def handle_request(self, p: RPCRequest):
         meth = p.method
@@ -300,11 +338,7 @@ class MiotApp(MiotApplication):
             else:
                 rets.append(error_prop(did, siid, piid))
 
-        # wait for the result
-        r, _ = await asyncio.wait(rets)
-        rets = [ts.result() for ts in r]
-
-        # construct the response
+        # wait for the result, and construct the response
         return [
             {
                 k: v
@@ -317,7 +351,7 @@ class MiotApp(MiotApplication):
                 ]
                 if v is not null
             }
-            for did, siid, piid, code, value in rets
+            for did, siid, piid, code, value in await asyncio.gather(rets)
         ]
 
     async def _rpc_set_properties(self, p: RPCRequest) -> list[dict[str, Any]]:
@@ -363,11 +397,7 @@ class MiotApp(MiotApplication):
             else:
                 rets.append(error_prop(did, siid, piid, value))
 
-        # wait for the result
-        r, _ = await asyncio.wait(rets)
-        rets = [ts.result() for ts in r]
-
-        # construct the response
+        # wait for the result, and construct the response
         return [
             {
                 'did'  : did,
@@ -375,7 +405,7 @@ class MiotApp(MiotApplication):
                 'piid' : piid,
                 'code' : code,
             }
-            for did, siid, piid, code in rets
+            for did, siid, piid, code in await asyncio.gather(rets)
         ]
 
     __rpc_handlers__ = {

@@ -3,6 +3,8 @@
 
 import asyncio
 
+from typing import Optional
+
 from asyncio import Queue
 from asyncio import DatagramProtocol
 from asyncio import DatagramTransport
@@ -31,7 +33,7 @@ class UdpSocket:
             self.port.close()
             self.closed = True
 
-    def sendto(self, buf: bytes, addr: tuple[str, int]):
+    def sendto(self, buf: bytes, addr: Optional[tuple[str, int]] = None):
         if self.closed:
             raise ConnectionError('send to closed socket')
         else:

@@ -55,7 +55,7 @@ class CameraMiscPIID(IntEnum):
     RSSI                = 6     # i16   = -100
     Online              = 7     # bool  = False
     PowerFreq           = 8     # u8    = 50
-    BatteryVoltage      = -1    # virtual PIID
+    BatteryVoltage      = 100   # virtual PIID
 
 class DetectionMiscPIID(IntEnum):
     RecordFreq          = 1     # u16   = 0
@@ -111,6 +111,9 @@ class Property:
     async def _do_write(self, value: Any):
         raise NotImplementedError('write()', value)
 
+    def _do_update(self, value: Any):
+        raise NotImplementedError('update()', value)
+
     async def read(self) -> Any:
         t0 = time.monotonic()
         ret = await self._do_read()
@@ -124,6 +127,14 @@ class Property:
             t0 = time.monotonic()
             await self._do_write(value)
             self.log.debug('Wrote property %s with value %r in %.3fms.' % (self.name, value, (time.monotonic() - t0) * 1000))
+
+    def update(self, value: Any):
+        if not isinstance(value, self.ty):
+            raise TypeError('%s expected for %s.%s, got %s' % (self.ty, self.name, type(value)))
+        else:
+            t0 = time.monotonic()
+            self._do_update(value)
+            self.log.debug('Updated property %s with value %r in %.3fms.' % (self.name, value, (time.monotonic() - t0) * 1000))
 
 class FuncProperty(Property):
     getter: Optional[Callable[[], Future[Any]]]
@@ -152,7 +163,10 @@ class FuncProperty(Property):
         else:
             await self.setter(value)
 
-class ConstProperty(Property):
+    def _do_update(self, value: Any):
+        raise PermissionError('Update property %s with value %r is not supported.' % (self.name, value))
+
+class ValueProperty(Property):
     log   : Logger
     value : Any
 
@@ -167,6 +181,33 @@ class ConstProperty(Property):
     async def _do_write(self, value: Any):
         self.log.warning('Writting %r to read-only property %s, discarded.' % (value, self.name))
 
+    def _do_update(self, value: Any):
+        self.value = value
+
+class MutableProperty(Property):
+    value  : Any
+    notify : Optional[Callable[[Property, Any], Future]]
+
+    def __init__(self,
+        siid   : SIID,
+        piid   : PIID,
+        init   : Any,
+        notify : Optional[Callable[[Property, Any], Future]] = None,
+    ):
+        self.value = init
+        self.notify = notify
+        super().__init__(siid, piid, type(init))
+
+    async def _do_read(self) -> Any:
+        return self.value
+
+    async def _do_write(self, value: Any):
+        self.notify and await self.notify(self, value)
+        self.value = value
+
+    def _do_update(self, value: Any):
+        self.value = value
+
 class Properties:
     log   : Logger
     props : dict[SIID, dict[PIID, Property]]
@@ -176,13 +217,21 @@ class Properties:
         self.props = {}
         self.register(*props)
 
-    def __getitem__(self, ids: tuple[SIID, PIID]) -> Property:
-        if ids[0] not in self.props:
-            raise ValueError('invalid SIID ' + str(ids[0]))
-        elif ids[1] not in self.props[ids[0]]:
-            raise ValueError('invalid PIID %s for SIID %s' % (ids[1], ids[0]))
+    def __getitem__(self, key: tuple[SIID, PIID]) -> Property:
+        siid, piid = key
+        return self.find(siid, piid)
+
+    def __setitem__(self, key: tuple[SIID, PIID], value: Any):
+        siid, piid = key
+        self.find(siid, piid).update(value)
+
+    def find(self, siid: SIID, piid: PIID) -> Property:
+        if siid not in self.props:
+            raise ValueError('no such SIID ' + str(siid))
+        elif piid not in self.props[siid]:
+            raise ValueError('no such PIID %s for SIID %s' % (piid, siid))
         else:
-            return self.props[ids[0]][ids[1]]
+            return self.props[siid][piid]
 
     def register(self, *props: Property):
         for p in props:
