@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import sys
 import logs
 import json
 import time
@@ -26,6 +27,10 @@ from miio import PinMode
 from miio import SignSuite
 from miio import CurveSuite
 from miio import PacketType
+
+from config import StaticKey
+from config import ConfigurationFile
+from config import DeviceConfiguration
 
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -124,7 +129,7 @@ class PairingSession:
         resp.raise_for_error()
         return resp
 
-    async def pair(self):
+    async def pair(self) -> DeviceInfo:
         self.log.info('Querying device information ...')
         resp = await self._request('miIO.info')
 
@@ -315,16 +320,22 @@ class PairingSession:
         offset = time.altzone if time.localtime().tm_isdst else time.timezone
         offset = -offset // 3600
 
+        # static key
+        key_buf = os.urandom(4)
+        key_num = int.from_bytes(key_buf, 'big')
+
         # dump the configuration
         ap_config = json.dumps(separators = (',', ':'), obj = {
-            'uid'         : uid,
-            'ssid'        : self.cfg.ssid,
-            'passwd'      : self.cfg.passwd,
-            'bind_key'    : 'a',
-            'config_type' : 'app',
-            'gmt_offset'  : offset,
-            'tz'          : time.tzname[time.daylight],
-            'wifi_config' : {'cc': 'CN'},
+            'uid'               : uid,
+            'ssid'              : self.cfg.ssid,
+            'passwd'            : self.cfg.passwd,
+            'bind_key'          : 'bindkeybindkeybi',
+            'config_type'       : 'app',
+            'static_key'        : StaticKey(key_num).key,
+            'static_key_number' : key_num,
+            'gmt_offset'        : offset,
+            'tz'                : time.tzname[time.daylight],
+            'wifi_config'       : {'cc': 'CN'},
         })
 
         # encrypt and sign the AP configuration
@@ -339,26 +350,28 @@ class PairingSession:
         )
 
         # check for response
-        if 'ok' in resp.data:
-            self.log.info('Configuration successful.')
-        else:
+        if 'ok' not in resp.data:
             raise ValueError('unexpected device response')
+
+        # return the device information
+        self.log.info('Configuration successful.')
+        return self.dev
 
     @classmethod
     async def probe(cls, url: str, cfg: ApSettings, addr: tuple[str, int]) -> 'PairingSession':
         log = logging.getLogger('pair')
-        log.info('Probing for devices ...')
+        log.info('Waiting for device ...')
 
         # receive the probe response
-        for _ in range(RETRY_COUNT):
+        while True:
             conn = await UdpSocket.new(remote_addr = addr)
             conn.sendto(Packet.probe_bytes())
 
             # attempt to receive the ACK
             try:
-                data, src = await asyncio.wait_for(conn.recvfrom(), REQUEST_TIMEOUT)
+                data, src = await asyncio.wait_for(conn.recvfrom(), 1.0)
             except asyncio.TimeoutError:
-                log.warning('Read timeout, try again.')
+                log.debug('Read timeout, try again.')
                 conn.close()
                 continue
 
@@ -369,10 +382,6 @@ class PairingSession:
             # resoponse does not come from the intended device
             log.warning('Address mismatch, try again.')
             conn.close()
-
-        # exceeds maximum retry count
-        else:
-            raise TimeoutError('timeout probing for devices')
 
         # parse the probing response
         repo = Packet.Gen()
@@ -402,6 +411,12 @@ __arguments__ = [
         help    = 'configuration file of your WiFi',
         type    = str,
         metavar = 'PASSWD',
+    )),
+    ('-o', '--save-config', dict(
+        help    = 'path to save the pairing information',
+        type    = str,
+        metavar = 'PATH',
+        default = 'mwc11.json',
     )),
     ('--device-addr', dict(
         help    = 'device address, default to 192.168.1.1',
@@ -435,20 +450,36 @@ async def main():
 
     # load the AP configuration
     if ns.ap_config:
-        cfg = ApSettings.load(ns.ap_config)
+        ap = ApSettings.load(ns.ap_config)
     elif ns.ssid and ns.passwd:
-        cfg = ApSettings(ns.ssid, ns.passwd)
+        ap = ApSettings(ns.ssid, ns.passwd)
     else:
         p.error('One of SSID / Password pair or AP configuration file must be specified.')
 
+    # load the configuration
+    try:
+        cfg = ConfigurationFile.load(ns.save_config)
+    except (KeyError, ValueError) as e:
+        log.error('Cannot load the configuration file: %s', e)
+        sys.exit(1)
+    except FileNotFoundError:
+        cfg = ConfigurationFile.create(ns.save_config)
+        log.info('Created a new configuration file.')
+
     # log the pairing configuration
-    log.info('AP SSID        : %s', cfg.ssid)
+    log.info('AP SSID        : %s', ap.ssid)
     log.info('Device Address : %s', ns.device_addr)
     log.info('Device Port    : %s', ns.device_port)
 
     # start the discovery
-    ps = await PairingSession.probe(ns.url, cfg, (ns.device_addr, ns.device_port))
-    await ps.pair()
+    ps = await PairingSession.probe(ns.url, ap, (ns.device_addr, ns.device_port))
+    dev = await ps.pair()
+
+    # keep the "tag" field intact
+    if dev.mac not in cfg.devices:
+        cfg.add_device(dev.mac, DeviceConfiguration())
+    else:
+        cfg.add_device(dev.mac, DeviceConfiguration(tag = cfg.devices[dev.mac].tag))
 
 if __name__ == '__main__':
     logs.setup()
