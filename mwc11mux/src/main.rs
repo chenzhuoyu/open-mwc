@@ -99,7 +99,6 @@ struct Connection {
     sta: TcpStream,
     mac: MACAddress,
     addr: AddressPair,
-    com_chan: BytesMut,
     com_send: Option<TcpStream>,
     com_recv: Option<TcpStream>,
     dsp_comm: Option<TcpStream>,
@@ -199,7 +198,6 @@ impl Connection {
             sta,
             mac,
             addr,
-            com_chan: BytesMut::with_capacity(65536),
             com_send: send,
             com_recv: recv,
             dsp_comm: None,
@@ -263,7 +261,7 @@ impl Connection {
                     conn.write_all_buf(&mut buf).await?;
                     Ok(())
                 } else {
-                    self.com_chan.extend_from_slice(&buf);
+                    log::warn!("COM_SEND for {} is not ready, dropped.", &self.mac);
                     Ok(())
                 }
             }
@@ -306,12 +304,11 @@ impl Connection {
 }
 
 impl Connection {
-    async fn update_com_send(&mut self, mut conn: TcpStream) -> Unit {
+    async fn update_com_send(&mut self, conn: TcpStream) -> Unit {
         match (conn.peer_addr()?, conn.local_addr()?) {
             (SocketAddr::V4(r), SocketAddr::V4(v))
                 if *v.ip() == self.addr.local && *r.ip() == self.addr.remote =>
             {
-                conn.write_all_buf(&mut self.com_chan).await?;
                 Self::notify(&mut self.sta, r, Channel::ComSend, Event::Connected).await?;
                 self.com_send = Some(conn);
                 Ok(())
