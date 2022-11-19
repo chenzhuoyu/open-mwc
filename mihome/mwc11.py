@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
 import logs
 import time
 import socket
@@ -27,10 +26,6 @@ from asyncio import WriteTransport
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from cryptography.hazmat.primitives.ciphers import Cipher
-from cryptography.hazmat.primitives.ciphers.modes import ECB
-from cryptography.hazmat.primitives.ciphers.algorithms import AES128
-
 from cryptography.hazmat.primitives.asymmetric.ec import ECDH
 from cryptography.hazmat.primitives.asymmetric.ec import SECP256R1
 from cryptography.hazmat.primitives.asymmetric.ec import generate_private_key
@@ -39,19 +34,24 @@ from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey
 from cryptography.hazmat.primitives._serialization import Encoding
 from cryptography.hazmat.primitives._serialization import PublicFormat
 
-from miio import Payload
-from miio import MACAddress
+from miot import MiotRPC
+from miot import RPCRequest
 
-from miio import RPCError
-from miio import RPCRequest
-from miio import RPCResponse
+from mwc1x import StaticKey
+from mwc1x import SessionKey
+from mwc1x import DeviceTag
+from mwc1x import Configuration
+from mwc1x import DeviceConfiguration
 
-from config import DeviceTag
-from config import StaticKey
-from config import SessionKey
-from config import Configuration
-from config import ConfigurationFile
-from config import DeviceConfiguration
+from props import Properties
+from props import ValueProperty
+
+from props import OTAPIID
+from props import CameraSIID
+from props import DetectionPIID
+from props import CameraMiscPIID
+from props import CameraControlPIID
+from props import DetectionMiscPIID
 
 LOG_FMT         = '%(asctime)s %(name)s [%(levelname)s] %(message)s'
 LOG_LEVEL       = logging.DEBUG
@@ -601,108 +601,254 @@ class ChannelEvent(IntEnum):
     Connected    = 0,
     Disconnected = 1
 
-class Device:
-    online: bool
+class Connection:
+    mac            : bytes
+    log            : Logger
+    rpc            : MiotRPC
+    mux            : MuxConnection
+    dev            : DeviceConfiguration
+    port           : CommandTransport
+    props          : Properties
+    demux          : FrameDemux
+    tokens         : SessionTokens
+    event_listener : Optional['EventListener']
 
-class Binder:
-    rnd: bytes
+    class EventListener:
+        def on_configuration_changed(self):
+            raise NotImplementedError('on_configuration_changed()')
+
+    def __init__(self,
+        mac            : bytes,
+        rpc            : MiotRPC,
+        mux            : MuxConnection,
+        dev            : DeviceConfiguration,
+        props          : Properties,
+        tokens         : SessionTokens,
+        *,
+        event_listener : Optional[EventListener] = None,
+    ):
+        self.mac            = mac
+        self.rpc            = rpc
+        self.mux            = mux
+        self.dev            = dev
+        self.log            = logging.getLogger('mwc11.conn.' + mac.hex('-'))
+        self.port           = CommandTransport(dev.session_key, mux, tokens)
+        self.demux          = FrameDemux()
+        self.props          = props
+        self.tokens         = tokens
+        self.event_listener = event_listener
+
+    async def _cmd_nop(self, _: Packet):
+        pass
+
+    async def _cmd_heartbeat(self, p: Packet):
+        data = memoryview(p.data)
+        level, rssi, volt = struct.unpack('I4xi2xH', data[:16])
+
+        # update properties
+        self.props[CameraSIID.Misc, CameraMiscPIID.RSSI] = rssi
+        self.props[CameraSIID.Misc, CameraMiscPIID.BatteryLevel] = level
+        self.props[CameraSIID.Misc, CameraMiscPIID.BatteryVoltage] = volt
+
+    async def _cmd_push_device_uid(self, p: Packet):
+        self.dev.tag = DeviceTag.parse(p.data.rstrip(b'\x00').decode('utf-8'))
+        self.log.debug('Device tag was updated.')
+
+        # notify the event listener if
+        if self.event_listener:
+            self.event_listener.on_configuration_changed()
+
+    __command_handlers__ = {
+        PacketCmd.Heartbeat       : _cmd_heartbeat,
+        PacketCmd.SystemStart     : _cmd_nop,
+        PacketCmd.PushDeviceUID   : _cmd_push_device_uid,
+        PacketCmd.RequestUSBState : _cmd_nop,
+    }
+
+    async def _keepalive(self):
+        while not self.mux.closed:
+            did = self.dev.tag.did
+            rssi = await self.props[CameraSIID.Misc, CameraMiscPIID.RSSI].read()
+
+            # send the keep-alive
+            try:
+                await self.rpc.send('_sync.subdev_keep_alive', {'did': did, 'rssi': rssi}, timeout = 1.0)
+            except TimeoutError:
+                self.log.warning('Keepalive timeout, try again.')
+                continue
+
+            # wait for the next keep-alive
+            for _ in range(10):
+                if not self.mux.closed:
+                    await asyncio.sleep(1.0)
+                else:
+                    break
+
+    async def _handle_events(self):
+        while True:
+            try:
+                rd = self.mux.reader(MuxType.StaConn)
+                chan, event, port, addr = struct.unpack('BBH4s', await rd.readexactly(8))
+            except EOFError:
+                break
+
+            # check the channel and event
+            try:
+                chan = Channel(chan)
+                event = ChannelEvent(event)
+            except ValueError:
+                self.log.error('Invalid event data, dropped.')
+                continue
+
+            # log the event
+            addr = socket.inet_ntop(socket.AF_INET, addr)
+            self.log.debug('Received event from %s:%d. event = %s.%s', addr, port, chan.name, event.name)
+
+            # handle the events
+            match chan, event:
+                case Channel.ComSend, ChannelEvent.Connected:
+                    self.log.debug('Update COM_SEND channel to %s:%d.', addr, port)
+                    self.tokens.update(port)
+
+    async def _handle_frames(self):
+        while True:
+            try:
+                rd = self.mux.reader(MuxType.UdpData)
+                req = await FrameSerdes.read(rd, self.dev.session_key)
+            except EOFError:
+                break
+
+            # TODO: this
+            if req.type == FrameCmd.Nested:
+                print(req)
+
+    async def _handle_requests(self):
+        while True:
+            try:
+                rd = self.mux.reader(MuxType.ComData)
+                req = await PacketSerdes.read(rd, key = self.dev.session_key)
+            except EOFError:
+                break
+
+            # verify token
+            if req.token != self.tokens.rx:
+                self.log.warning('Cannot verify token, dropped. packet = %s', req)
+                continue
+
+            # attempt to handle the command response
+            if self.port.handle_packet(req):
+                self.log.debug('Received response: %s', req)
+                continue
+
+            # handle the command, if possible
+            if req.cmd in self.__command_handlers__:
+                await self.__command_handlers__[req.cmd](self, req)
+            else:
+                self.log.debug('Unhandled command %s, dropped.', req.cmd)
+
+    async def run(self):
+        did = self.dev.tag.did
+        self.log.info('Camera is initializing ...')
+
+        # send the device information
+        while True:
+            try:
+                await self.rpc.send('_sync.subdev_upinfo', did = did, fw_ver = CAM_VER, timeout = 1.0)
+            except TimeoutError:
+                self.log.warning('State transition timeout, try again.')
+            else:
+                break
+
+        # mark the online state
+        await self.rpc.send('properties_changed', {
+            'did'   : did,
+            'siid'  : CameraSIID.Misc,
+            'piid'  : CameraMiscPIID.Online,
+            'value' : True,
+        })
+
+        # start all the tasks
+        fut = [
+            self._keepalive(),
+            self._handle_events(),
+            self._handle_frames(),
+            self._handle_requests(),
+        ]
+
+        # wait for them to complete
+        self.log.info('Camera is now online.')
+        await asyncio.gather(*fut)
+
+class Instance:
+    mac   : bytes
+    dev   : DeviceConfiguration
+    conn  : Optional[Connection]
+    props : Properties
+
+    def __init__(self, mac: bytes, dev: DeviceConfiguration):
+        self.mac   = mac
+        self.dev   = dev
+        self.conn  = None
+        self.props = Properties(
+            ValueProperty ( CameraSIID.Control       , CameraControlPIID.PowerSwitch   , True   ),
+            ValueProperty ( CameraSIID.Control       , CameraControlPIID.Flip          , 0      ),
+            ValueProperty ( CameraSIID.Control       , CameraControlPIID.NightVision   , 2      ),
+            ValueProperty ( CameraSIID.Control       , CameraControlPIID.OSDTimestamp  , True   ),
+            ValueProperty ( CameraSIID.Control       , CameraControlPIID.WDR           , True   ),
+            ValueProperty ( CameraSIID.Misc          , CameraMiscPIID.LED              , True   ),
+            ValueProperty ( CameraSIID.Misc          , CameraMiscPIID.LiveStream       , 0      ),
+            ValueProperty ( CameraSIID.Misc          , CameraMiscPIID.Distortion       , True   ),
+            ValueProperty ( CameraSIID.Misc          , CameraMiscPIID.BatteryLevel     , 0      ),
+            ValueProperty ( CameraSIID.Misc          , CameraMiscPIID.Resolution       , 0      ),
+            ValueProperty ( CameraSIID.Misc          , CameraMiscPIID.RSSI             , 0      ),
+            ValueProperty ( CameraSIID.Misc          , CameraMiscPIID.Online           , False  ),
+            ValueProperty ( CameraSIID.Misc          , CameraMiscPIID.PowerFreq        , 50     ),
+            ValueProperty ( CameraSIID.Misc          , CameraMiscPIID.BatteryVoltage   , 0      ),
+            ValueProperty ( CameraSIID.DetectionMisc , DetectionMiscPIID.RecordFreq    , 0      ),
+            ValueProperty ( CameraSIID.DetectionMisc , DetectionMiscPIID.RecordLimit   , 10     ),
+            ValueProperty ( CameraSIID.DetectionMisc , DetectionMiscPIID.Enabled       , True   ),
+            ValueProperty ( CameraSIID.Detection     , DetectionPIID.Enabled           , True   ),
+            ValueProperty ( CameraSIID.Detection     , DetectionPIID.RecordInterval    , 30     ),
+            ValueProperty ( CameraSIID.Detection     , DetectionPIID.RecordSensitivity , 100    ),
+            ValueProperty ( CameraSIID.OTA           , OTAPIID.Progress                , 100    ),
+            ValueProperty ( CameraSIID.OTA           , OTAPIID.State                   , 'idle' ),
+        )
+
+    @classmethod
+    def build(cls, cfg: Configuration) -> dict[bytes, 'Instance']:
+        return {
+            mac: cls(mac, dev)
+            for mac, dev in cfg.devices.items()
+        }
+
+class DeviceBinder:
     mac: bytes
     log: Logger
+    rpc: MiotRPC
     mux: MuxConnection
+    cfg: Configuration
+    key: Optional[StaticKey]
 
     # curve and key size
     __curve__    = SECP256R1()
     __key_size__ = (__curve__.key_size * 2) // 8 + 1
 
-    class Retry(Exception):
-        pass
-
-    def __init__(self, mac: bytes, mux: MuxConnection):
+    def __init__(self,
+        mac: bytes,
+        rpc: MiotRPC,
+        mux: MuxConnection,
+        cfg: Configuration,
+    ):
         self.mac = mac
+        self.rpc = rpc
         self.mux = mux
+        self.cfg = cfg
         self.key = None
-        self.rnd = os.urandom(16)
         self.log = logging.getLogger('mwc11.bind')
 
-    def _mk_hash(self, did: str, psk: bytes, rand: bytes) -> str:
-        key = HKDF(SHA256(), 16, did.encode('utf-8'), b'secure-proxy-auth').derive(psk)
-        return Cipher(AES128(key), ECB()).encryptor().update(rand).hex()
-
-    def _exec_rpc(self, req: RPCRequest, dev: DeviceConfiguration) -> RPCResponse:
-        func = self.__rpc_handler__.get(req.method)
-        self.log.debug('Executing RPC request: %s', req)
-
-        # check for method name
-        if func is None:
-            self.log.warning('Unsupported RPC method: %s', req.method)
-            return RPCResponse(req.id, error = RPCError(RPCError.Code.InvalidParameters, 'unknown method'))
-
-        # execute the RPC handler
-        resp = func(self, req, dev)
-        self.log.debug('RPC response: %s', resp)
-        return resp
-
-    def _exec_auth(self, req: RPCRequest, dev: DeviceConfiguration) -> RPCResponse:
-        rid = req.id
-        psk = dev.tag.psk
-
-        # parse the arguments
-        try:
-            did = Payload.type_checked(req.args['did'], str)
-            name = Payload.type_checked(req.args['model'], str)
-            rand = bytes.fromhex(Payload.type_checked(req.args['random_dev'], str))
-        except (KeyError, ValueError):
-            self.log.error('Invalid RPC request: %s', req)
-            return RPCResponse(rid, error = RPCError(RPCError.Code.InvalidParameters, "invalid args"))
-
-        # compute the response hash
-        resp = self.rnd.hex()
-        conf = self._mk_hash(did, psk, rand)
-        self.log.debug('Authentication from device %s. model = %s', did, name)
-
-        # construct the response
-        return RPCResponse(rid, data = {
-            "did"            : did,
-            "random_server"  : resp,
-            "confirm_server" : conf,
-        })
-
-    def _exec_bind(self, req: RPCRequest, dev: DeviceConfiguration) -> RPCResponse:
-        rid = req.id
-        psk = dev.tag.psk
-
-        # parse the arguments
-        try:
-            did = Payload.type_checked(req.args['did'], str)
-            name = Payload.type_checked(req.args['model'], str)
-            conf = Payload.type_checked(req.args['confirm_dev'], str)
-            addr = MACAddress.parse(Payload.type_checked(req.args['mac'], str))
-        except (KeyError, ValueError):
-            self.log.error('Invalid RPC request: %s', req)
-            return RPCResponse(rid, error = RPCError(RPCError.Code.InvalidParameters, "invalid args"))
-
-        # check the address
-        if addr != self.mac:
-            self.log.error('MAC address mismatch: %s != %s', addr.hex(':'), self.mac.hex(':'))
-            return RPCResponse(rid, error = RPCError(RPCError.Code.InvalidParameters, "MAC address mismatch"))
-
-        # calculate the signature
-        rand = self.rnd
-        resp = self._mk_hash(did, psk, rand)
-
-        # verify the signature
-        if resp != conf:
-            self.log.error('Signature mismatch: %s != %s', conf, resp)
-            return RPCResponse(rid, error = RPCError(RPCError.Code.InvalidParameters, "signature mismatch"))
-
-        # construct the response
-        self.log.info('Accepted bind request from device %s. model = %s', did, name)
-        return RPCResponse(rid, data = {'bind_code': 1})
-
-    __rpc_handler__ = {
-        '_sync.subdev_secure_bind'   : _exec_bind,
-        '_sync.subdev_secure_authen' : _exec_auth,
-    }
+    def _drop_key(self):
+        if self.key is not None:
+            self.cfg.remove_static_key(self.key)
 
     async def _wait_cmd(self, *cmds: PacketCmd, key: Optional[SessionKey] = None) -> Packet:
         while True:
@@ -710,15 +856,12 @@ class Binder:
             req = await PacketSerdes.read(rd, key = key)
 
             # wait for the expected command
-            if req.cmd not in cmds:
+            if req.cmd in cmds:
+                return req
+            else:
                 self.log.debug('Dropping unexpected packet: %s', req)
-                continue
 
-            # log the packet
-            self.log.debug('Received packet: %s', req)
-            return req
-
-    async def bind(self, dev: DeviceConfiguration):
+    async def _bind_device(self) -> Instance:
         req = await self._wait_cmd(PacketCmd.ExchangeBindInfo)
         pkey, skid = struct.unpack('128s4xI4x', req.data[:140])
 
@@ -732,6 +875,10 @@ class Binder:
         rkey = nkey.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
         skey = nkey.exchange(ECDH(), EllipticCurvePublicKey.from_encoded_point(self.__curve__, pkey))
 
+        # check for static key ID
+        if skid not in self.cfg.static_keys:
+            raise ValueError('static key %d not found' % skid)
+
         # calculate the AES key
         salt = StaticKey(skid).key.encode('utf-8')
         ekey = SessionKey(HKDF(SHA256(), 16, salt, b'xmitech-auth-srv').derive(skey))
@@ -741,7 +888,7 @@ class Binder:
         self.log.info('Requesting binding information for "%s".', self.mac.hex(':'))
 
         # proxy the RPC request
-        resp = self._exec_rpc(req, dev)
+        resp = await self.rpc.proxy(req)
         error = resp.error
 
         # check for RPC errors
@@ -783,7 +930,7 @@ class Binder:
 
         # check the received server public bytes
         if xkey[:xlen] != rkey:
-            raise ValueError('server public key mismatch')
+            raise ValueError('server public key mismatch.')
 
         # parse the device tag and model
         mod = desc.rstrip(b'\x00').decode('utf-8')
@@ -794,7 +941,7 @@ class Binder:
         self.log.info('Confirming binding information for "%s".', self.mac.hex(':'))
 
         # proxy the RPC request
-        resp = self._exec_rpc(req, dev)
+        resp = await self.rpc.proxy(req)
         error = resp.error
 
         # check for RPC errors
@@ -818,117 +965,118 @@ class Binder:
         if code != 0:
             raise ValueError('bind error with code %d' % code)
 
-        # update the configuration
-        dev.tag         = tag
-        dev.model       = mod
-        dev.auth_key    = akey
-        dev.static_key  = StaticKey(skid)
-        dev.session_key = ekey
+        # bind successful
         self.log.info('Bind successful.')
+        return Instance(self.mac, DeviceConfiguration(tag, mod, akey, StaticKey(skid), ekey))
 
-    async def query_tag(self) -> DeviceTag:
-        PacketSerdes.write(self.mux.writer(MuxType.ComData), Packet(REQ_VER, PacketCmd.GetConfigInfo, bytes(16)))
-        PacketSerdes.write(self.mux.writer(MuxType.ComData), Packet(REQ_VER, PacketCmd.SystemStart, bytes(16)))
-
-        # attempt to get a PushDeviceUID packet
+    async def bind(self) -> Instance:
         try:
-            key = SessionKey.empty()
-            req = await asyncio.wait_for(self._wait_cmd(PacketCmd.PushDeviceUID, key = key), 1.0)
-        except EOFError:
-            self.log.debug('EOF, retry with new connection.')
-            raise self.Retry from None
-        except asyncio.TimeoutError:
-            self.log.debug('Query timeout, retry with new connection.')
-            raise self.Retry from None
+            return await self._bind_device()
+        finally:
+            self._drop_key()
 
-        # attempt to decode the packet
-        try:
-            return DeviceTag.parse(req.data.rstrip(b'\x00').decode('utf-8'))
-        except ValueError as e:
-            self.log.warning('Cannot parse the response, retry with new connection. error = %s', e)
-            raise self.Retry from None
-
-class Station:
+class MWC11:
     log: Logger
-    run: set[bytes]
+    rpc: MiotRPC
     cfg: Configuration
+    cam: dict[bytes, Instance]
 
-    def __init__(self, cfg: Configuration):
+    class EventListener(Connection.EventListener):
+        cfg: Configuration
+
+        def __init__(self, cfg: Configuration):
+            self.cfg = cfg
+
+        def on_configuration_changed(self):
+            self.cfg.save()
+
+    def __init__(self, rpc: MiotRPC, cfg: Configuration):
         self.cfg = cfg
-        self.run = set()
-        self.log = logging.getLogger('mwc11')
+        self.rpc = rpc
+        self.log = logging.getLogger('mwc11.station')
+        self.cam = Instance.build(cfg)
+
+    def find(self, did: str) -> Optional[Instance]:
+        for cam in self.cam.values():
+            if cam.dev.tag.did == did:
+                return cam
+        else:
+            return None
 
     async def serve_forever(self, host: str = STATION_BIND, port: int = STATION_PORT):
         srv = await asyncio.start_server(self._serve_connection, host = host, port = port)
         await srv.serve_forever()
 
     async def _serve_connection(self, rd: StreamReader, wr: StreamWriter):
-        mux = MuxConnection(rd, wr)
-        asyncio.get_running_loop().create_task(mux.run())
-
-        # handle the connection
         try:
-            await self._handle_connection(mux)
+            await self._handle_connection(rd, wr)
         except Exception:
             self.log.exception('Exception when handling connection:')
 
-        # close the mux and write channel
-        mux.close()
-        wr.close()
+    async def _handle_connection(self, rd: StreamReader, wr: StreamWriter):
+        mux = MuxConnection(rd, wr)
+        asyncio.get_running_loop().create_task(mux.run())
 
-    async def _handle_connection(self, mux: MuxConnection):
+        # read the MAC address, local address and remote address
         buf = await mux.reader(MuxType.StaInit).readexactly(14)
-        buf = memoryview(buf)
+        mac, local, remote = struct.unpack('>6s4s4s', buf)
 
-        # extract the fields
-        mac = bytes(buf[:6])
-        local = socket.inet_ntop(socket.AF_INET, buf[6:10])
-        remote = socket.inet_ntop(socket.AF_INET, buf[10:])
+        # find the camera instance
+        cam = self.cam.get(mac)
+        local = socket.inet_ntop(socket.AF_INET, local)
+        remote = socket.inet_ntop(socket.AF_INET, remote)
 
-        # check for paired devices
-        if mac not in self.cfg.devices:
-            self.log.warning('Unexpected connection from "%s", dropped.', mac.hex(':'))
-            return
-
-        # get the device configuration
-        dev = self.cfg.devices[mac]
-        tag, skey = dev.tag, dev.session_key
-
-        # no device tag, it's a paired but not registered device
-        if not tag:
-            if mac not in self.run:
-                self.run.add(mac)
-                self.log.info('Please wait until the camera times out.')
-                self.log.info('Please trigger a PIR recording, do whatever you can to achieve this.')
-                self.log.info('For example, you can wave your hands in front of the camera.')
-                self.log.info('If no PIRs are being triggered within 10 seconds after timeout, start over.')
-
-            # attempt to fetch the device tag
+        # check for MAC addressm
+        if cam is None:
             try:
-                dev.tag = await Binder(mac, mux).query_tag()
-            except Binder.Retry:
+                self.cam[mac] = cam = await DeviceBinder(mac, self.rpc, mux, self.cfg).bind()
+                self.cfg.add_device(mac, cam.dev)
+            except ValueError as e:
+                mux.close()
+                self.log.error('Cannot register device "%s": %s', mac.hex(':'), e)
+                return
+            except TimeoutError:
+                mux.close()
+                self.log.error('Cannot register device "%s": timeout.', mac.hex(':'))
                 return
 
-            # save the configuration
-            dev.save()
-            self.log.info('Device tag fetched successfully, please reset and re-pair the device.')
-            self.run.remove(mac)
+        # check for duplicated connections
+        if cam.conn is not None:
+            mux.close()
+            self.log.warning('Duplicated connection from "%s", dropped.', mac.hex(':'))
             return
 
-        # no session key, it's tag is available, but still not registered
-        if not skey:
-            try:
-                await Binder(mac, mux).bind(dev)
-            except Exception as e:
-                self.log.error('Cannot bind device "%s". Error: %s', mac.hex(), e)
-            else:
-                dev.save()
+        # create a new connection
+        conn = Connection(
+            mac            = mac,
+            mux            = mux,
+            dev            = cam.dev,
+            rpc            = self.rpc,
+            props          = cam.props,
+            tokens         = SessionTokens(cam.dev.session_key, local, remote),
+            event_listener = self.EventListener(self.cfg),
+        )
 
-        # TODO: device handle logic
-        print(mac, local, remote)
+        # register the connection, and mark online
+        cam.conn = conn
+        cam.props[CameraSIID.Misc, CameraMiscPIID.Online] = True
+        self.log.info('New connection from "%s".', mac.hex(':'))
+
+        # serve the connection
+        try:
+            await conn.run()
+        except Exception:
+            self.log.exception('Unhandled error from connection "%s":', mac.hex(':'))
+        else:
+            self.log.info('Connection from "%s" closed.', mac.hex(':'))
+
+        # mark offline, unregister and close the connection
+        cam.props[CameraSIID.Misc, CameraMiscPIID.Online] = False
+        cam.conn = None
+        mux.close()
 
 async def main():
-    await Station(ConfigurationFile.load('mwc11.json')).serve_forever()
+    pass
 
 if __name__ == '__main__':
     logs.setup()

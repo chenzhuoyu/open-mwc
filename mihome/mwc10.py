@@ -38,8 +38,6 @@ from miot import MiotRPC
 from miot import MiotApplication
 from miot import MiotConfiguration
 
-from miss import MissServer
-
 from mwc11 import MWC11
 from mwc11 import STATION_BIND
 from mwc11 import STATION_PORT
@@ -73,7 +71,6 @@ class MiotApp(MiotApplication):
     cfg    : Configuration
     bind   : str
     port   : int
-    miss   : MissServer
     props  : Properties
     uptime : int
 
@@ -119,7 +116,6 @@ class MiotApp(MiotApplication):
         self.log    = logging.getLogger('mwc10')
         self.bind   = bind
         self.port   = port
-        self.miss   = MissServer(rpc, self.cfg.station.bind_key)
         self.uptime = cfg.uptime
 
         # initialize all const properties
@@ -233,8 +229,7 @@ class MiotApp(MiotApplication):
 
         # perform the handshake, and start the application
         try:
-            if await self.miss.handshake():
-                await self.cam.serve_forever(bind, port)
+            await self.cam.serve_forever(bind, port)
         except Exception:
             self.log.exception('Error when handling requests:')
 
@@ -351,7 +346,7 @@ class MiotApp(MiotApplication):
                 ]
                 if v is not null
             }
-            for did, siid, piid, code, value in await asyncio.gather(rets)
+            for did, siid, piid, code, value in await asyncio.gather(*rets)
         ]
 
     async def _rpc_set_properties(self, p: RPCRequest) -> list[dict[str, Any]]:
@@ -405,7 +400,7 @@ class MiotApp(MiotApplication):
                 'piid' : piid,
                 'code' : code,
             }
-            for did, siid, piid, code in await asyncio.gather(rets)
+            for did, siid, piid, code in await asyncio.gather(*rets)
         ]
 
     __rpc_handlers__ = {

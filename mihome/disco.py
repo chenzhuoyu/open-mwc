@@ -314,8 +314,10 @@ class Discovery:
             except Exception:
                 self.log.exception('Cannot parse the request:')
                 continue
-            else:
-                self.log.debug('Received packet: %r', req)
+
+            # wait for 100ms every packet, to make the time sync happy
+            self.log.debug('Received packet: %r', req)
+            await asyncio.sleep(0.1)
 
             # dispatch by packet type
             match req.type:
@@ -324,7 +326,7 @@ class Discovery:
                     resp = resp and repo.rpc(self.dev.did, resp)
                 case PacketType.Probe:
                     self.rpc.hs.reset()
-                    resp = repo.probe_ack(self.dev.did, self.dev.key.token)
+                    resp = repo.ack(self.dev.did, self.dev.key.token)
                 case PacketType.Keepalive:
                     self.log.debug('Keepalive from client.')
                 case _:
