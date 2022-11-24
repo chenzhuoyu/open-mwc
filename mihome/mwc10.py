@@ -5,14 +5,8 @@ import time
 import json
 import base64
 import asyncio
-import logging
 import argparse
 import netifaces
-
-from logging import Logger
-
-from typing import Any
-from typing import Optional
 
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -28,6 +22,8 @@ from cryptography.hazmat.primitives.asymmetric.ec import ECDH
 from cryptography.hazmat.primitives.asymmetric.ec import SECP256R1
 from cryptography.hazmat.primitives.asymmetric.ec import generate_private_key
 from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey
+
+from logs import Logger
 
 from miio import Payload
 from miio import RPCError
@@ -72,7 +68,7 @@ class MiotApp(MiotApplication):
     bind   : str
     port   : int
     props  : Properties
-    uptime : int
+    uptime : float
 
     __arguments__ = [
         ('-c', '--config', dict(
@@ -113,7 +109,7 @@ class MiotApp(MiotApplication):
         self.cfg    = ConfigurationFile.load(fn)
         self.cam    = MWC11(rpc, self.cfg)
         self.did    = cfg.security_provider.device_id
-        self.log    = logging.getLogger('mwc10')
+        self.log    = Logger.for_name('mwc10')
         self.bind   = bind
         self.port   = port
         self.uptime = cfg.uptime
@@ -155,9 +151,12 @@ class MiotApp(MiotApplication):
         else:
             return { 'localIp': info['addr'], 'mask': info['netmask'], 'gw': addr }
 
-    def _send_reply(self, p: RPCRequest, *, data: Any = None, error: Optional[Exception] = None):
-        self.log.debug('RPC response: %r', RPCResponse(p.id, data = data, error = error))
-        self.rpc.reply_to(p, data = data, error = error)
+    def _send_reply(self, p: RPCRequest, *, data: object = None, error: RPCError | None = None):
+        if p.id is None:
+            raise RuntimeError('invalid request ID')
+        else:
+            self.log.debug('RPC response: %r', RPCResponse(p.id, data = data, error = error))
+            self.rpc.reply_to(p, data = data, error = error)
 
     async def _stats(self):
         for _ in range(3):
@@ -259,8 +258,8 @@ class MiotApp(MiotApplication):
         else:
             self._send_reply(p, data = resp)
 
-    async def _rpc_get_gwinfo(self, p: RPCRequest) -> dict[str, Any]:
-        pkey = base64.b64decode(Payload.type_checked(p.args['app_pub_key'], str))
+    async def _rpc_get_gwinfo(self, p: RPCRequest) -> dict[str, object]:
+        pkey = base64.b64decode(Payload.type_checked(p.dict['app_pub_key'], str))
         skey = self.cfg.new_static_key()
 
         # compose the plain text
@@ -291,12 +290,12 @@ class MiotApp(MiotApplication):
             'encrypt_data' : base64.b64encode(rbuf).decode('utf-8'),
         }
 
-    async def _rpc_get_properties(self, p: RPCRequest) -> list[dict[str, Any]]:
+    async def _rpc_get_properties(self, p: RPCRequest) -> list[dict[str, object]]:
         rets = []
         null = object()
 
         # property getter
-        async def read_prop(did: str, prop: Property) -> tuple[str, SIID, PIID, int, Any]:
+        async def read_prop(did: str, prop: Property) -> tuple[str, SIID, PIID, int, object]:
             try:
                 data = await prop.read()
             except (ValueError, PermissionError) as e:
@@ -307,16 +306,17 @@ class MiotApp(MiotApplication):
                 return did, prop.siid, prop.piid, 0, data
 
         # property errors
-        async def error_prop(did: str, siid: SIID, piid: PIID) -> tuple[str, SIID, PIID, int, Any]:
+        async def error_prop(did: str, siid: SIID, piid: PIID) -> tuple[str, SIID, PIID, int, object]:
             self.log.warning('Cannot read property %s.%d.%d: device not found', did, siid, piid)
             return did, siid, piid, RPCError.Code.NoSuchProperty, null
 
         # fetch every property
-        for item in p.args:
+        for item in p.dict:
             try:
-                did  = Payload.type_checked(item['did'], str)
-                siid = Payload.type_checked(item['siid'], int)
-                piid = Payload.type_checked(item['piid'], int)
+                obj  = Payload.type_checked(item, dict)
+                did  = Payload.type_checked(obj['did'], str)
+                siid = Payload.type_checked(obj['siid'], int)
+                piid = Payload.type_checked(obj['piid'], int)
             except (KeyError, TypeError, ValueError) as e:
                 self.log.error('Invalid RPC request: %s', e)
                 raise RPCError(-1, 'invalid request') from None
@@ -349,12 +349,12 @@ class MiotApp(MiotApplication):
             for did, siid, piid, code, value in await asyncio.gather(*rets)
         ]
 
-    async def _rpc_set_properties(self, p: RPCRequest) -> list[dict[str, Any]]:
+    async def _rpc_set_properties(self, p: RPCRequest) -> list[dict[str, object]]:
         rets = []
-        args = p.args
+        args = p.dict
 
         # property setter
-        async def write_prop(did: str, prop: Property, value: Any) -> tuple[str, SIID, PIID, int]:
+        async def write_prop(did: str, prop: Property, value: object) -> tuple[str, SIID, PIID, int]:
             try:
                 await prop.write(value)
             except (ValueError, PermissionError) as e:
@@ -365,17 +365,18 @@ class MiotApp(MiotApplication):
                 return did, prop.siid, prop.piid, 0
 
         # property errors
-        async def error_prop(did: str, siid: SIID, piid: PIID, value: Any) -> tuple[str, SIID, PIID, int]:
+        async def error_prop(did: str, siid: SIID, piid: PIID, value: object) -> tuple[str, SIID, PIID, int]:
             self.log.warning('Cannot write %r to property %s.%d.%d: device not found', value, did, siid, piid)
             return did, siid, piid, RPCError.Code.NoSuchProperty
 
         # fetch every property
         for item in args:
             try:
-                did   = Payload.type_checked(item['did'], str)
-                siid  = Payload.type_checked(item['siid'], int)
-                piid  = Payload.type_checked(item['piid'], int)
-                value = item['value']
+                obj   = Payload.type_checked(item, dict)
+                did   = Payload.type_checked(obj['did'], str)
+                siid  = Payload.type_checked(obj['siid'], int)
+                piid  = Payload.type_checked(obj['piid'], int)
+                value = obj['value']
             except (KeyError, TypeError, ValueError) as e:
                 self.log.error('Invalid RPC request: %s', e)
                 raise RPCError(-1, 'invalid request') from None

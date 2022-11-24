@@ -17,16 +17,13 @@ import requests
 import importlib.util
 
 from enum import IntEnum
+from typing import Sequence
 from logging import Logger
 from weakref import ReferenceType
 from functools import cached_property
 
 from ssl import SSLContext
 from ssl import DER_cert_to_PEM_cert
-
-from typing import Any
-from typing import Optional
-from typing import Sequence
 
 from asyncio import Future
 from asyncio import TimerHandle
@@ -88,7 +85,7 @@ class LoginRequest(Payload):
     did  : int
     cert : str
     rand : str
-    sign : str
+    sign : bytes
     algo : list[SignSuite]
 
     def __init__(
@@ -97,7 +94,7 @@ class LoginRequest(Payload):
         cert : str = '',
         rand : str = '',
         sign : bytes = b'',
-        algo : Optional[list[SignSuite]] = None,
+        algo : list[SignSuite] | None = None,
     ):
         self.did  = did
         self.cert = cert
@@ -234,16 +231,16 @@ class PacketType(IntEnum):
     }
 
     @classmethod
-    def parse(cls, ty: 'PacketType', data: bytes) -> Optional[Payload]:
+    def parse(cls, ty: 'PacketType', data: bytes) -> Payload | None:
         ctor = cls.__factory__[ty]
         return ctor and ctor.from_bytes(data)
 
 class Packet:
     ty   : PacketType
     seq  : int
-    data : Optional[Payload]
+    data : Payload | None
 
-    def __init__(self, ty: PacketType, seq: int, data: Optional[Payload] = None):
+    def __init__(self, ty: PacketType, seq: int, data: Payload | None = None):
         self.ty   = ty
         self.seq  = seq
         self.data = data
@@ -273,7 +270,7 @@ class Packet:
         cert : str = '',
         rand : str = '',
         sign : bytes = b'',
-        algo : Optional[list[SignSuite]] = None,
+        algo : list[SignSuite] | None = None,
     ) -> 'Packet':
         return Packet(PacketType.Login, seq, LoginRequest(did, cert, rand, sign, algo))
 
@@ -402,7 +399,7 @@ class LoginCtx:
         else:
             raise ValueError('invalid signature algorithm')
 
-    def stage1(self, seq: int) -> LoginRequest:
+    def stage1(self, seq: int) -> Packet:
         return Packet.login(
             seq  = seq,
             did  = self.secp.device_id,
@@ -411,7 +408,7 @@ class LoginCtx:
             algo = self.__suites__,
         )
 
-    def stage2(self, seq: int) -> LoginRequest:
+    def stage2(self, seq: int) -> Packet:
         return Packet.login(
             seq  = seq,
             did  = self.secp.device_id,
@@ -441,6 +438,11 @@ class MiotRPC:
         self.waiter = {}
         self.sender = sender
 
+    def _sender(self) -> Sender:
+        ret = self.sender()
+        assert ret is not None
+        return ret
+
     def _next_id(self) -> int:
         while True:
             rng = struct.unpack('H', os.urandom(2))[0]
@@ -451,28 +453,43 @@ class MiotRPC:
                 self.incr += 1
                 return rid
 
-    def _drop_timer(self, pid: int):
-        if pid in self.waiter:
-            self.waiter.pop(pid)[1].cancel()
-
-    def _fire_timeout(self, pid: int):
-        if pid in self.waiter:
-            fut, _ = self.waiter.pop(pid)
-            fut.cancelled() or fut.set_exception(TimeoutError)
-
     def _send_request(self, req: RPCRequest, timeout: float = REQUEST_TIMEOUT) -> Future[RPCResponse]:
-        snd = self.sender()
-        fut = asyncio.get_running_loop().create_future()
-        tmr = asyncio.get_running_loop().call_later(timeout, self._fire_timeout, req.id)
-        self.waiter[req.id] = (fut, tmr)
-        snd.send_packet(Packet.request(snd.next_seq(), req))
-        fut.add_done_callback(lambda _: self._drop_timer(req.id))
-        return fut
+        rid = req.id
+        snd = self._sender()
 
-    @staticmethod
-    def _update_request_id(fut: Future[RPCResponse], rid: int):
-        if fut.done() and not fut.cancelled() and fut.exception() is None:
-            fut.result().id = rid
+        # check request ID
+        if rid is None:
+            raise ValueError('invalid request')
+
+        # timeout routine
+        def fire_timeout():
+            val = self.waiter.pop(rid, (None, None))
+            fut, tmr = val
+
+            # check for concurrent conditions
+            if fut is None: return False
+            if tmr is None: raise  SystemError('unreachable')
+
+            # do not set exceptions on cancelled futures
+            if not fut.cancelled():
+                fut.set_exception(TimeoutError)
+
+        # register the timeout callback
+        fut = asyncio.get_running_loop().create_future()
+        tmr = asyncio.get_running_loop().call_later(timeout, fire_timeout)
+
+        # timer removal routine
+        def drop_timer(_):
+            if rid in self.waiter:
+                self.waiter.pop(rid)[1].cancel()
+
+        # transmit the packet
+        snd.send_packet(Packet.request(snd.next_seq(), req))
+        fut.add_done_callback(drop_timer)
+
+        # add to waiter list
+        self.waiter[rid] = (fut, tmr)
+        return fut
 
     def send(self, method: str, *args, timeout: float = REQUEST_TIMEOUT, **kwargs) -> Future[RPCResponse]:
         if args and kwargs:
@@ -481,34 +498,50 @@ class MiotRPC:
             return self._send_request(RPCRequest(method, id = self._next_id(), args = args or kwargs), timeout)
 
     def proxy(self, req: RPCRequest, *, timeout: float = REQUEST_TIMEOUT) -> Future[RPCResponse]:
-        if req.id not in self.waiter:
+        rid = req.id
+        args = req.args
+
+        # check request ID
+        if rid is None:
+            raise ValueError('invalid request')
+
+        # no ID confliction, send directly
+        if rid not in self.waiter:
             return self._send_request(req)
-        else:
-            ret = self._send_request(RPCRequest(req.method, id = self._next_id(), args = req.args), timeout)
-            ret.add_done_callback(lambda f: self._update_request_id(f, req.id))
-            return ret
+
+        # request update routine
+        def update_request_id(fut: Future[RPCResponse]):
+            if fut.done() and not fut.cancelled() and fut.exception() is None:
+                fut.result().id = rid
+
+        # allocate a new ID
+        ret = self._send_request(RPCRequest(req.method, id = self._next_id(), args = args), timeout)
+        ret.add_done_callback(update_request_id)
+        return ret
 
     def notify(self, method: str, *args, **kwargs):
         if args and kwargs:
             raise ValueError('args and kwargs cannot be present at the same time')
         else:
-            snd = self.sender()
+            snd = self._sender()
             snd.send_packet(Packet.request(snd.next_seq(), RPCRequest(method, args = args or kwargs)))
 
-    def reply_to(self, p: RPCRequest, *, data: Optional[Any] = None, error: Optional[RPCError] = None):
-        snd = self.sender()
-        snd.send_packet(Packet.response(snd.next_seq(), RPCResponse(p.id, data = data, error = error)))
+    def reply_to(self, p: RPCRequest, *, data: object = None, error: RPCError | None = None):
+        if p.id is None:
+            raise ValueError('invalid request')
+        else:
+            snd = self._sender()
+            snd.send_packet(Packet.response(snd.next_seq(), RPCResponse(p.id, data = data, error = error)))
 
     def handle_response(self, p: RPCResponse):
         pid = p.id
         fut, tmr = self.waiter.pop(pid, (None, None))
 
-        # check if it's a valid response
-        if fut is None:
-            self.log.warning('Unexpected RPC response, dropped: %r', p)
-            return
+        # check if it is the expected packet
+        if fut is None: return False
+        if tmr is None: raise  SystemError('unreachable')
 
-        # cancel the timeout, and resolve the future
+        # stop the timer, and resolve the future
         tmr.cancel()
         fut.set_result(p)
 
@@ -520,7 +553,7 @@ class MiotConfiguration:
 
     def __init__(self,
         app_class         : type['MiotApplication'],
-        security_provider : Optional[MiotSecurityProvider] = None,
+        security_provider : MiotSecurityProvider | None = None,
         *args             : str,
     ):
         self.args              = list(args)
@@ -616,6 +649,31 @@ class MiotConnection(Sender):
         self.wr.write(p.to_bytes())
         self.log.debug('Packet %s with Seq %d was transmitted in %.3fms.', p.ty.name, p.seq, (time.monotonic_ns() - t) / 1e6)
 
+    def _login_fsm_next(self, p: LoginResponse):
+        match self.state:
+            case 'wait_login_1':
+                if p.code == LoginStatus.Stage2:
+                    self.state = 'login_2'
+                    self.login.update(p)
+                elif p.code == LoginStatus.NoCode:
+                    self.state = 'retry_login_1'
+                    self.log.warning('Login failure, retry after 1 second: unknown error')
+                else:
+                    self.state = 'retry_login_1'
+                    self.log.warning('Login failure, retry after 1 second: %s: %s', p.code, p.msg)
+            case 'wait_login_2':
+                if p.code == LoginStatus.Ok:
+                    self.state = 'online'
+                    self.log.info('Login successful')
+                elif p.code == LoginStatus.NoCode:
+                    self.state = 'retry_login_1'
+                    self.log.warning('Login failure, retry after 1 second: unknown error')
+                else:
+                    self.state = 'retry_login_1'
+                    self.log.warning('Login failure, retry after 1 second: %s: %s', p.code, p.msg)
+            case state:
+                self.log.warning('LoginAck at the wrong state (%s), dropped.' % state)
+
     async def _timesync(self):
         while True:
             dt = time.monotonic() - self.cfg.uptime
@@ -655,37 +713,15 @@ class MiotConnection(Sender):
     async def _network_handler(self, p: Packet):
         match p.ty:
             case PacketType.RPC:
-                await self.app.handle_request(p.data)
+                await self.app.handle_request(Payload.type_checked(p.data, RPCRequest))
             case PacketType.RPCAck:
-                self.rpc.handle_response(p.data)
+                self.rpc.handle_response(Payload.type_checked(p.data, RPCResponse))
             case PacketType.SyncAck:
-                self.log.debug('Time-sync from server. utc_ms = %d', p.data.utc_ms)
+                self.log.debug('Time-sync from server. utc_ms = %d', Payload.type_checked(p.data, SyncResponse).utc_ms)
             case PacketType.KeepaliveAck:
                 self.log.debug('Keep-alive from server.')
             case PacketType.LoginAck:
-                match self.state:
-                    case 'wait_login_1':
-                        if p.data.code == LoginStatus.Stage2:
-                            self.state = 'login_2'
-                            self.login.update(p.data)
-                        elif p.data.code == LoginStatus.NoCode:
-                            self.state = 'retry_login_1'
-                            self.log.warning('Login failure, retry after 1 second: unknown error')
-                        else:
-                            self.state = 'retry_login_1'
-                            self.log.warning('Login failure, retry after 1 second: %s: %s', p.data.code, p.data.msg)
-                    case 'wait_login_2':
-                        if p.data.code == LoginStatus.Ok:
-                            self.state = 'online'
-                            self.log.info('Login successful')
-                        elif p.data.code == LoginStatus.NoCode:
-                            self.state = 'retry_login_1'
-                            self.log.warning('Login failure, retry after 1 second: unknown error')
-                        else:
-                            self.state = 'retry_login_1'
-                            self.log.warning('Login failure, retry after 1 second: %s: %s', p.data.code, p.data.msg)
-                    case state:
-                        self.log.warning('LoginAck at the wrong state (%s), dropped.' % state)
+                self._login_fsm_next(Payload.type_checked(p.data, LoginResponse))
             case _:
                 self.log.warning('Unexpected packet, dropped: %r', p)
 
@@ -780,15 +816,20 @@ class MiotAppLoader:
         # load the module
         tnow = time.monotonic()
         spec = importlib.util.spec_from_file_location('miot_app', app)
-        inst = importlib.util.module_from_spec(spec)
 
-        # insert into modules
-        sys.modules['miot_app'] = inst
-        spec.loader.exec_module(inst)
+        # check the module loader
+        if spec is None or spec.loader is None:
+            log.error('Cannot load application module.')
+            sys.exit(1)
+
+        # execute the module
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules['miot_app'] = mod
+        spec.loader.exec_module(mod)
 
         # find the class
         try:
-            app_class = getattr(inst, klass)
+            app_class = getattr(mod, klass)
         except AttributeError:
             log.error('Class not found: %s:%s' % (app, klass))
             sys.exit(1)

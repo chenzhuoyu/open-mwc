@@ -2,17 +2,12 @@
 # -*- coding: utf-8 -*-
 
 import time
-import logging
 
+from logs import Logger
 from enum import IntEnum
-from asyncio import Future
-from logging import Logger
-from functools import cached_property
-
-from typing import Any
-from typing import Union
 from typing import Callable
-from typing import Optional
+from asyncio import Future
+from functools import cached_property
 
 class CameraSIID(IntEnum):
     Control             = 2
@@ -74,17 +69,8 @@ class StorageControlPIID(IntEnum):
     Type                = 2     # u8    = 0
     LightIndicator      = 3     # bool  = True
 
-SIID = Union[
-    CameraSIID,
-    StationSIID,
-]
-
-PIID = Union[
-    OTAPIID,
-    StoragePIID,
-    CameraControlPIID,
-    StorageControlPIID,
-]
+SIID = int | CameraSIID | StationSIID
+PIID = int | OTAPIID | StoragePIID | CameraControlPIID | StorageControlPIID
 
 class Property:
     ty   : type
@@ -94,7 +80,7 @@ class Property:
 
     def __init__(self, siid: SIID, piid: PIID, ty: type):
         self.ty   = ty
-        self.log  = logging.getLogger('props')
+        self.log  = Logger.for_name('props')
         self.siid = siid
         self.piid = piid
 
@@ -105,22 +91,22 @@ class Property:
     def name(self) -> str:
         return '%s.%s' % (self.siid.name, self.piid.name)
 
-    async def _do_read(self) -> Any:
+    async def _do_read(self) -> object:
         raise NotImplementedError('read()')
 
-    async def _do_write(self, value: Any):
+    async def _do_write(self, value: object):
         raise NotImplementedError('write()', value)
 
-    def _do_update(self, value: Any):
+    def _do_update(self, value: object):
         raise NotImplementedError('update()', value)
 
-    async def read(self) -> Any:
+    async def read(self) -> object:
         t0 = time.monotonic()
         ret = await self._do_read()
         self.log.debug('Read property %s returns %r in %.3fms.' % (self.name, ret, (time.monotonic() - t0) * 1000))
         return ret
 
-    async def write(self, value: Any):
+    async def write(self, value: object):
         if not isinstance(value, self.ty):
             raise TypeError('%s expected for %s.%s, got %s' % (self.ty, self.name, type(value)))
         else:
@@ -128,7 +114,7 @@ class Property:
             await self._do_write(value)
             self.log.debug('Wrote property %s with value %r in %.3fms.' % (self.name, value, (time.monotonic() - t0) * 1000))
 
-    def update(self, value: Any):
+    def update(self, value: object):
         if not isinstance(value, self.ty):
             raise TypeError('%s expected for %s.%s, got %s' % (self.ty, self.name, type(value)))
         else:
@@ -137,75 +123,79 @@ class Property:
             self.log.debug('Updated property %s with value %r in %.3fms.' % (self.name, value, (time.monotonic() - t0) * 1000))
 
 class FuncProperty(Property):
-    getter: Optional[Callable[[], Future[Any]]]
-    setter: Optional[Callable[[Any], Future[None]]]
+    getter: Callable[[], Future[object]] | None
+    setter: Callable[[object], Future[None]] | None
 
     def __init__(self,
         siid   : SIID,
         piid   : PIID,
         ty     : type,
-        getter : Optional[Callable[[], Future[Any]]] = None,
-        setter : Optional[Callable[[Any], Future[None]]] = None,
+        getter : Callable[[], Future[object]] | None = None,
+        setter : Callable[[object], Future[None]] | None = None,
     ):
         self.getter = getter
         self.setter = setter
         super().__init__(siid, piid, ty)
 
-    async def _do_read(self) -> Any:
+    async def _do_read(self) -> object:
         if self.getter is None:
             raise PermissionError('property %s is not readable' % self.name)
         else:
             return await self.getter()
 
-    async def _do_write(self, value: Any):
+    async def _do_write(self, value: object):
         if self.setter is None:
             raise PermissionError('property %s is not writable' % self.name)
         else:
             await self.setter(value)
 
-    def _do_update(self, value: Any):
+    def _do_update(self, value: object):
         raise PermissionError('Update property %s with value %r is not supported.' % (self.name, value))
 
 class ValueProperty(Property):
     log   : Logger
-    value : Any
+    value : object
 
-    def __init__(self, siid: SIID, piid: PIID, value: Any):
-        self.log   = logging.getLogger('props')
+    def __init__(self, siid: SIID, piid: PIID, value: object):
+        self.log   = Logger.for_name('props')
         self.value = value
         super().__init__(siid, piid, type(value))
 
-    async def _do_read(self) -> Any:
+    async def _do_read(self) -> object:
         return self.value
 
-    async def _do_write(self, value: Any):
+    async def _do_write(self, value: object):
         self.log.warning('Writting %r to read-only property %s, discarded.' % (value, self.name))
 
-    def _do_update(self, value: Any):
+    def _do_update(self, value: object):
         self.value = value
 
 class MutableProperty(Property):
-    value  : Any
-    notify : Optional[Callable[[Property, Any], Future]]
+    value  : object
+    notify : Callable[[Property, object], Future] | None
 
     def __init__(self,
         siid   : SIID,
         piid   : PIID,
-        init   : Any,
-        notify : Optional[Callable[[Property, Any], Future]] = None,
+        init   : object,
+        notify : Callable[[Property, object], Future] | None = None,
     ):
         self.value = init
         self.notify = notify
         super().__init__(siid, piid, type(init))
 
-    async def _do_read(self) -> Any:
+    async def _notify(self, value: object):
+        if self.notify:
+            await self.notify(self, value)
+
+    async def _do_read(self) -> object:
         return self.value
 
-    async def _do_write(self, value: Any):
-        self.notify and await self.notify(self, value)
+    async def _do_write(self, value: object):
+        await self._notify(value)
         self.value = value
 
-    def _do_update(self, value: Any):
+    def _do_update(self, value: object):
         self.value = value
 
 class Properties:
@@ -213,7 +203,7 @@ class Properties:
     props : dict[SIID, dict[PIID, Property]]
 
     def __init__(self, *props: Property):
-        self.log   = logging.getLogger('props')
+        self.log   = Logger.for_name('props')
         self.props = {}
         self.register(*props)
 
@@ -221,7 +211,7 @@ class Properties:
         siid, piid = key
         return self.find(siid, piid)
 
-    def __setitem__(self, key: tuple[SIID, PIID], value: Any):
+    def __setitem__(self, key: tuple[SIID, PIID], value: object):
         siid, piid = key
         self.find(siid, piid).update(value)
 

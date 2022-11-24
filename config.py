@@ -9,9 +9,6 @@ import hashlib
 from weakref import ReferenceType
 from functools import cached_property
 
-from typing import Any
-from typing import Optional
-
 from cryptography.hazmat.primitives.ciphers import Cipher
 from cryptography.hazmat.primitives.ciphers.modes import CBC
 from cryptography.hazmat.primitives.ciphers.algorithms import AES128
@@ -20,8 +17,8 @@ from miio import Payload
 from miio import MACAddress
 
 class EventListener:
-    def on_config_changed(self):
-        raise NotImplementedError('on_config_changed()')
+    def on_save_requested(self):
+        raise NotImplementedError('on_save_requested()')
 
 class StaticKey(int):
     @cached_property
@@ -96,28 +93,28 @@ class DeviceTag:
             return cls(sn1, sn2, did, mac, oob.encode('utf-8'), psk.encode('utf-8'))
 
     @classmethod
-    def parse_opt(cls, info: str) -> Optional['DeviceTag']:
+    def parse_opt(cls, info: str) -> 'DeviceTag | None':
         if not info:
             return None
         else:
             return cls.parse(info)
 
 class DeviceConfiguration:
-    tag            : Optional[DeviceTag]
+    tag            : DeviceTag | None
     model          : str
     auth_key       : bytes
     static_key     : StaticKey
     session_key    : SessionKey
-    event_listener : Optional[EventListener]
+    event_listener : EventListener | None
 
     def __init__(self,
         *,
-        tag            : Optional[DeviceTag]     = None,
-        model          : str                     = '',
-        auth_key       : bytes                   = b'',
-        static_key     : StaticKey               = 0,
-        session_key    : SessionKey              = b'',
-        event_listener : Optional[EventListener] = None,
+        tag            : DeviceTag | None     = None,
+        model          : str                  = '',
+        auth_key       : bytes                = b'',
+        static_key     : StaticKey            = StaticKey(0),
+        session_key    : SessionKey           = SessionKey.empty(),
+        event_listener : EventListener | None = None,
     ):
         self.tag            = tag
         self.model          = model
@@ -139,9 +136,9 @@ class DeviceConfiguration:
 
     def save(self):
         if self.event_listener is not None:
-            self.event_listener.on_config_changed()
+            self.event_listener.on_save_requested()
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             k: v
             for k, v in (
@@ -155,7 +152,7 @@ class DeviceConfiguration:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any], *, event_listener: Optional[EventListener] = None) -> 'DeviceConfiguration':
+    def from_dict(cls, data: dict[str, object], *, event_listener: EventListener | None = None) -> 'DeviceConfiguration':
         return cls(
             tag            = DeviceTag.parse_opt(Payload.type_checked(data.get('tag', ''), str)),
             model          = Payload.type_checked(data.get('model', ''), str),
@@ -167,12 +164,12 @@ class DeviceConfiguration:
 
 class Configuration:
     devices        : dict[bytes, DeviceConfiguration]
-    event_listener : Optional[EventListener]
+    event_listener : EventListener | None
 
     def __init__(self,
         *,
-        devices        : Optional[dict[bytes, DeviceConfiguration]] = None,
-        event_listener : Optional[EventListener] = None,
+        devices        : dict[bytes, DeviceConfiguration] | None = None,
+        event_listener : EventListener | None = None,
     ):
         self.devices        = devices or {}
         self.event_listener = event_listener
@@ -191,9 +188,9 @@ class Configuration:
 
     def save(self):
         if self.event_listener is not None:
-            self.event_listener.on_config_changed()
+            self.event_listener.on_save_requested()
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             'devices' : {
                 k.hex(':'): v.to_dict()
@@ -207,7 +204,7 @@ class Configuration:
         self.save()
 
     @classmethod
-    def from_dict(cls, cfg: dict[str, Any], *, event_listener: Optional[EventListener] = None) -> 'Configuration':
+    def from_dict(cls, cfg: dict[str, object], *, event_listener: EventListener | None = None) -> 'Configuration':
         return cls(
             event_listener = event_listener,
             devices        = {
@@ -217,21 +214,36 @@ class Configuration:
         )
 
 class ConfigurationFile(EventListener):
-    cfg  : Optional[ReferenceType[Configuration]]
-    name : str
+    _cfg  : ReferenceType[Configuration] | None
+    _name : str
 
     def __init__(self, name: str = 'mwc1x.json'):
-        self.cfg  = None
-        self.name = name
+        self._cfg  = None
+        self._name = name
 
-    def on_config_changed(self):
-        if self.cfg is not None:
-            cfg = self.cfg().to_dict()
-            data = json.dumps(cfg, indent = 4, sort_keys = True)
+    @property
+    def cfg(self) -> Configuration:
+        if self._cfg is None:
+            raise SystemError('uninitialized')
+        else:
+            ret = self._cfg()
+            assert ret is not None
+            return ret
 
-            # write to file after serializing to avoid destroying the old config
-            with open(self.name, 'w') as fp:
-                fp.write(data)
+    @property
+    def name(self) -> str:
+        if self._cfg is None:
+            raise SystemError('uninitialized')
+        else:
+            return self._name
+
+    def on_save_requested(self):
+        cfg = self.cfg.to_dict()
+        data = json.dumps(cfg, indent = 4, sort_keys = True)
+
+        # write to file after serializing to avoid destroying the old config
+        with open(self._name, 'w') as fp:
+            fp.write(data)
 
     @classmethod
     def load(cls, name: str) -> 'Configuration':
@@ -239,12 +251,12 @@ class ConfigurationFile(EventListener):
             ret = cls(name)
             val = Payload.type_checked(json.load(fp), dict)
             cfg = Configuration.from_dict(val, event_listener = ret)
-            ret.cfg = ReferenceType(cfg)
+            ret._cfg = ReferenceType(cfg)
             return cfg
 
     @classmethod
     def create(cls, name: str) -> 'Configuration':
         ret = cls(name)
         cfg = Configuration(devices = {}, event_listener = ret)
-        ret.cfg = ReferenceType(cfg)
+        ret._cfg = ReferenceType(cfg)
         return cfg

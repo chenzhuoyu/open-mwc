@@ -8,12 +8,10 @@ import json
 import time
 import base64
 import asyncio
-import logging
 import argparse
 
 from udp import UdpSocket
-from typing import Any
-from logging import Logger
+from logs import Logger
 
 from miio import Payload
 from miio import RPCRequest
@@ -66,7 +64,7 @@ class ApSettings:
         return cls.from_dict(Payload.type_checked(json.loads(src), dict))
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> 'ApSettings':
+    def from_dict(cls, data: dict[str, object]) -> 'ApSettings':
         return cls(
             ssid   = Payload.type_checked(data['ssid'], str),
             passwd = Payload.type_checked(data['passwd'], str),
@@ -84,7 +82,7 @@ class PairingSession:
         self.rid  = 1
         self.cfg  = cfg
         self.dev  = dev
-        self.log  = logging.getLogger('pair')
+        self.log  = Logger.for_name('pair')
         self.conn = conn
         self.repo = repo
 
@@ -135,18 +133,18 @@ class PairingSession:
 
         # extract the response fields
         try:
-            token = bytes.fromhex(Payload.type_checked(resp.data['token'], str))
+            token = bytes.fromhex(Payload.type_checked(resp.dict['token'], str))
         except KeyError:
             raise ValueError('invalid handshake stage 1 response') from None
 
         # check the token
         if self.dev.key.token != token:
-            raise ValueError('pairing token mismatch: %s != %s' % (token.hex(), self.key.token.hex()))
+            raise ValueError('pairing token mismatch: %s != %s' % (token.hex(), self.dev.key.token.hex()))
 
         # extract the device information
-        uid = Payload.type_checked(resp.data['uid'], int)
-        model = Payload.type_checked(resp.data['model'], str)
-        miio_ver = Payload.type_checked(resp.data['miio_ver'], str)
+        uid = Payload.type_checked(resp.dict['uid'], int)
+        model = Payload.type_checked(resp.dict['model'], str)
+        miio_ver = Payload.type_checked(resp.dict['miio_ver'], str)
 
         # query device capabilities
         self.log.info('UID: %d, Device model: %s, MiIO version: %s', uid, model, miio_ver)
@@ -155,9 +153,9 @@ class PairingSession:
 
         # extract the response fields
         try:
-            ty = Payload.type_checked(resp.data['type'], int)
-            oob = Payload.type_checked(resp.data['oob'], dict)
-            ecdh = Payload.type_checked(resp.data['ecdh'], dict)
+            ty = Payload.type_checked(resp.dict['type'], int)
+            oob = Payload.type_checked(resp.dict['oob'], dict)
+            ecdh = Payload.type_checked(resp.dict['ecdh'], dict)
         except KeyError:
             raise ValueError('invalid handshake stage 1 response') from None
 
@@ -215,8 +213,8 @@ class PairingSession:
 
         # extract the response fields
         try:
-            ty = Payload.type_checked(resp.data['type'], int)
-            ecdh = Payload.type_checked(resp.data['ecdh'], dict)
+            ty = Payload.type_checked(resp.dict['type'], int)
+            ecdh = Payload.type_checked(resp.dict['ecdh'], dict)
         except KeyError:
             raise ValueError('invalid handshake stage 2 response') from None
 
@@ -228,7 +226,7 @@ class PairingSession:
         try:
             sign = base64.b64decode(Payload.type_checked(ecdh['sign'], str))
             pubkey = base64.b64decode(Payload.type_checked(ecdh['public_key'], str))
-        except KeyError:
+        except (KeyError, ValueError):
             raise ValueError('invalid handshake stage 2 response') from None
 
         # perform the key exchange
@@ -256,10 +254,11 @@ class PairingSession:
 
         # extract the response fields
         try:
-            ty = Payload.type_checked(resp.data['type'], int)
-            step = Payload.type_checked(resp.data['oob']['step'], int)
-            ssign = base64.b64decode(Payload.type_checked(resp.data['oob']['sign'], str))
-        except (KeyError, TypeError):
+            ty = Payload.type_checked(resp.dict['type'], int)
+            oob = Payload.type_checked(resp.dict['oob'], dict[str, object])
+            step = Payload.type_checked(oob['step'], int)
+            ssign = base64.b64decode(Payload.type_checked(oob['sign'], str))
+        except (KeyError, TypeError, ValueError):
             raise ValueError('invalid handshake stage 3 step 1 response') from None
 
         # verify the stage
@@ -279,10 +278,11 @@ class PairingSession:
 
         # extract the response fields
         try:
-            ty = Payload.type_checked(resp.data['type'], int)
-            step = Payload.type_checked(resp.data['oob']['step'], int)
-            srand = base64.b64decode(Payload.type_checked(resp.data['oob']['random'], str))
-        except (KeyError, TypeError):
+            ty = Payload.type_checked(resp.dict['type'], int)
+            oob = Payload.type_checked(resp.dict['oob'], dict[str, object])
+            step = Payload.type_checked(oob['step'], int)
+            srand = base64.b64decode(Payload.type_checked(oob['random'], str))
+        except (KeyError, TypeError, ValueError):
             raise ValueError('invalid handshake stage 3 step 2 response') from None
 
         # verify the stage
@@ -302,10 +302,11 @@ class PairingSession:
 
         # extract the response fields
         try:
-            ty = Payload.type_checked(resp.data['type'], int)
-            step = Payload.type_checked(resp.data['oob']['step'], int)
-            ivec = base64.b64decode(Payload.type_checked(resp.data['oob']['iv'], str))
-        except (KeyError, TypeError):
+            ty = Payload.type_checked(resp.dict['type'], int)
+            oob = Payload.type_checked(resp.dict['oob'], dict[str, object])
+            step = Payload.type_checked(oob['step'], int)
+            ivec = base64.b64decode(Payload.type_checked(oob['iv'], str))
+        except (KeyError, TypeError, ValueError):
             raise ValueError('invalid handshake stage 3 step 3 response') from None
 
         # verify the stage
@@ -320,16 +321,16 @@ class PairingSession:
         offset = time.altzone if time.localtime().tm_isdst else time.timezone
         offset = -offset // 3600
 
-        # static key
-        key_buf = os.urandom(4)
-        key_num = int.from_bytes(key_buf, 'big')
+        # static key number and bind key
+        key_num = int.from_bytes(os.urandom(4), 'big')
+        bind_key = base64.b64encode(os.urandom(12)).decode('utf-8')
 
         # dump the configuration
         ap_config = json.dumps(separators = (',', ':'), obj = {
             'uid'               : uid,
             'ssid'              : self.cfg.ssid,
             'passwd'            : self.cfg.passwd,
-            'bind_key'          : 'bindkeybindkeybi',
+            'bind_key'          : bind_key,
             'config_type'       : 'app',
             'static_key'        : StaticKey(key_num).key,
             'static_key_number' : key_num,
@@ -350,7 +351,7 @@ class PairingSession:
         )
 
         # check for response
-        if 'ok' not in resp.data:
+        if 'ok' not in resp.dict:
             raise ValueError('unexpected device response')
 
         # return the device information
@@ -359,7 +360,7 @@ class PairingSession:
 
     @classmethod
     async def probe(cls, url: str, cfg: ApSettings, addr: tuple[str, int]) -> 'PairingSession':
-        log = logging.getLogger('pair')
+        log = Logger.for_name('pair')
         log.info('Waiting for device ...')
 
         # receive the probe response
@@ -446,7 +447,7 @@ async def main():
 
     # parse the command line
     ns = p.parse_args()
-    log = logging.getLogger('pair')
+    log = Logger.for_name('pair')
 
     # load the AP configuration
     if ns.ap_config:

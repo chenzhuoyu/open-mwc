@@ -8,7 +8,6 @@ import socket
 import struct
 import hashlib
 
-from typing import Any, Optional
 from functools import cached_property
 
 from cryptography.hazmat.primitives.ciphers import Cipher
@@ -19,7 +18,7 @@ from miio import Payload
 from miio import MACAddress
 
 class EventListener:
-    def save_config(self, cfg: dict[str, Any]):
+    def save_config(self, cfg: dict[str, object]):
         raise NotImplementedError('save_config()', cfg)
 
 class StaticKey(int):
@@ -106,14 +105,14 @@ class ApConfiguration:
             '}',
         ])
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             'ssid'   : self.ssid,
             'passwd' : self.passwd,
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> 'ApConfiguration':
+    def from_dict(cls, data: dict[str, object]) -> 'ApConfiguration':
         return cls(
             ssid   = Payload.type_checked(data['ssid'], str),
             passwd = Payload.type_checked(data['passwd'], str),
@@ -144,7 +143,7 @@ class DeviceConfiguration:
             '}',
         ])
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             'tag'         : str(self.tag),
             'model'       : self.model,
@@ -154,7 +153,7 @@ class DeviceConfiguration:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> 'DeviceConfiguration':
+    def from_dict(cls, data: dict[str, object]) -> 'DeviceConfiguration':
         return cls(
             tag         = DeviceTag.parse(Payload.type_checked(data['tag'], str)),
             model       = Payload.type_checked(data['model'], str),
@@ -191,7 +190,7 @@ class StationConfiguration:
             '}',
         ])
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             'did'      : self.did,
             'uid'      : self.uid,
@@ -202,7 +201,7 @@ class StationConfiguration:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]):
+    def from_dict(cls, data: dict[str, object]):
         return cls(
             Payload.type_checked(data['did'], int),
             Payload.type_checked(data['uid'], int),
@@ -217,14 +216,14 @@ class Configuration:
     station        : StationConfiguration
     devices        : dict[bytes, DeviceConfiguration]
     static_keys    : set[StaticKey]
-    event_listener : Optional[EventListener]
+    event_listener : EventListener | None
 
     def __init__(self,
         ap             : ApConfiguration,
         station        : StationConfiguration,
         *,
-        devices        : Optional[dict[bytes, DeviceConfiguration]] = None,
-        event_listener : Optional[EventListener] = None,
+        devices        : dict[bytes, DeviceConfiguration] | None = None,
+        event_listener : EventListener | None = None,
     ):
         self.ap             = ap
         self.station        = station
@@ -250,7 +249,7 @@ class Configuration:
         if self.event_listener is not None:
             self.event_listener.save_config(self.to_dict())
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             'ap'      : self.ap.to_dict(),
             'station' : self.station.to_dict(),
@@ -282,7 +281,7 @@ class Configuration:
             self.static_keys.remove(key)
 
     @classmethod
-    def from_dict(cls, cfg: dict[str, Any], *, event_listener: Optional[EventListener] = None) -> 'Configuration':
+    def from_dict(cls, cfg: dict[str, object], *, event_listener: EventListener | None = None) -> 'Configuration':
         return cls(
             ap             = ApConfiguration.from_dict(Payload.type_checked(cfg['ap'], dict)),
             station        = StationConfiguration.from_dict(Payload.type_checked(cfg['station'], dict)),
@@ -299,7 +298,7 @@ class ConfigurationFile(EventListener):
     def __init__(self, name: str = 'mwc1x.json'):
         self.name = name
 
-    def save_config(self, cfg: dict[str, Any]):
+    def save_config(self, cfg: dict[str, object]):
         name = self.name
         data = json.dumps(cfg, indent = 4, sort_keys = True)
 

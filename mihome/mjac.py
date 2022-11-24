@@ -160,7 +160,7 @@ class MJAC:
         i2c_freq : int = 1000000,
     ):
         i2c = I2cController()
-        i2c.configure(ftdi, frequency = i2c_freq)
+        i2c.configure(ftdi, frequency = i2c_freq)  # type: ignore
         i2c.log.setLevel(logging.ERROR)
 
         # initialize I2C device and GPIO port

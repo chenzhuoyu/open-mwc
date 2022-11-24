@@ -3,6 +3,7 @@
 
 import asyncio
 
+from typing import cast
 from typing import Optional
 
 from asyncio import Queue
@@ -48,4 +49,4 @@ class UdpSocket:
     @classmethod
     async def new(cls, *args, **kwargs) -> 'UdpSocket':
         port, proto = await asyncio.get_running_loop().create_datagram_endpoint(UdpProtocol, *args, **kwargs)
-        return cls(port, proto)
+        return cls(cast(DatagramTransport, port), proto)

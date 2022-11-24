@@ -10,11 +10,8 @@ import argparse
 import coloredlogs
 
 from udp import UdpSocket
-from logging import Logger
-
-from typing import Any
-from typing import Optional
 from typing import NamedTuple
+from logging import Logger
 
 from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -75,7 +72,7 @@ class Handshake:
             self.stage = d
             return True
 
-    def _stage_1(self) -> dict[str, Any]:
+    def _stage_1(self) -> dict[str, object]:
         if not self._advance(1, 2):
             raise RPCError(RPCError.Code.InvalidParameters, 'unexpected handshake stage 1')
         else:
@@ -91,10 +88,11 @@ class Handshake:
                 }
             }
 
-    def _stage_2(self, p: RPCRequest) -> dict[str, Any]:
-        algo = SignSuite(Payload.type_checked(p.args['ecdh']['sign_suite'], int))
-        curve = CurveSuite(Payload.type_checked(p.args['ecdh']['curve_suite'], int))
-        pubkey = base64.b64decode(Payload.type_checked(p.args['ecdh']['public_key'], str))
+    def _stage_2(self, p: RPCRequest) -> dict[str, object]:
+        ecdh = Payload.type_checked(p.dict['ecdh'], dict)
+        algo = SignSuite(Payload.type_checked(ecdh['sign_suite'], int))
+        curve = CurveSuite(Payload.type_checked(ecdh['curve_suite'], int))
+        pubkey = base64.b64decode(Payload.type_checked(ecdh['public_key'], str))
 
         # check for stage
         if not self._advance(2, 31):
@@ -122,19 +120,19 @@ class Handshake:
             },
         }
 
-    def _stage_3(self, p: RPCRequest) -> dict[str, Any]:
+    def _stage_3(self, p: RPCRequest) -> dict[str, object]:
         if not (31 <= self.stage <= 33):
             raise RPCError(RPCError.Code.InvalidParameters, 'unexpected handshake stage 3')
         else:
-            match Payload.type_checked(p.args['oob']['step'], int):
+            match Payload.type_checked(Payload.type_checked(p.dict['oob'], dict)['step'], int):
                 case 1: return self._stage_3_step_1(p)
                 case 2: return self._stage_3_step_2(p)
                 case 3: return self._stage_3_step_3(p)
                 case s: raise RPCError(-1, 'invalid step: %d' % s)
 
-    def _stage_3_step_1(self, p: RPCRequest) -> dict[str, Any]:
-        mode = p.args['oob']['mode']
-        mode = PinMode(Payload.type_checked(mode, int))
+    def _stage_3_step_1(self, p: RPCRequest) -> dict[str, object]:
+        oob = Payload.type_checked(p.dict['oob'], dict)
+        mode = PinMode(Payload.type_checked(oob['mode'], int))
 
         # check for pin mode and step
         if mode != self.pin.mode:
@@ -155,9 +153,9 @@ class Handshake:
             }
         }
 
-    def _stage_3_step_2(self, p: RPCRequest) -> dict[str, Any]:
-        sign = p.args['oob']['sign']
-        sign = Payload.type_checked(sign, str)
+    def _stage_3_step_2(self, p: RPCRequest) -> dict[str, object]:
+        oob = Payload.type_checked(p.dict['oob'], dict)
+        sign = Payload.type_checked(oob['sign'], str)
 
         # check for stage, and decode the sign bytes
         if not self._advance(32, 33):
@@ -174,9 +172,9 @@ class Handshake:
             }
         }
 
-    def _stage_3_step_3(self, p: RPCRequest) -> dict[str, Any]:
-        rand = p.args['oob']['random']
-        rand = Payload.type_checked(rand, str)
+    def _stage_3_step_3(self, p: RPCRequest) -> dict[str, object]:
+        oob = Payload.type_checked(p.dict['oob'], dict)
+        rand = Payload.type_checked(oob['random'], str)
 
         # check for stage
         if not self._advance(33, 0):
@@ -205,9 +203,9 @@ class Handshake:
         self.sign  = b''
         self.stage = 1
 
-    def handle(self, p: RPCRequest) -> dict[str, Any]:
+    def handle(self, p: RPCRequest) -> dict[str, object]:
         try:
-            match Payload.type_checked(p.args['type'], int):
+            match Payload.type_checked(p.dict['type'], int):
                 case 1: return self._stage_1()
                 case 2: return self._stage_2(p)
                 case 3: return self._stage_3(p)
@@ -219,7 +217,7 @@ class Handshake:
 class RPCHandler:
     hs  : Handshake
     log : Logger
-    cfg : Optional['Config']
+    cfg : 'Config' | None
 
     class Config(NamedTuple):
         uid      : int
@@ -232,9 +230,13 @@ class RPCHandler:
         self.cfg = None
         self.log = logging.getLogger('disco.rpc')
 
-    async def handle_request(self, p: RPCRequest) -> Optional[RPCResponse]:
+    async def handle_request(self, p: RPCRequest) -> RPCResponse | None:
         meth = p.method
         func = self.__rpc_handlers__.get(meth)
+
+        # must have an ID
+        if p.id is None:
+            return RPCResponse(0, error = RPCError(-1, 'invalid request ID'))
 
         # check for method
         if func is None:
@@ -259,12 +261,12 @@ class RPCHandler:
     async def _rpc_nop(self, _: RPCRequest) -> list[str]:
         return ['ok']
 
-    async def _rpc_miio_handshake(self, p: RPCRequest) -> dict[str, Any]:
+    async def _rpc_miio_handshake(self, p: RPCRequest) -> dict[str, object]:
         return self.hs.handle(p)
 
     async def _rpc_miio_config_router_safe(self, p: RPCRequest) -> list[str]:
-        data = base64.b64decode(Payload.type_checked(p.args['data'], str))
-        sign = base64.b64decode(Payload.type_checked(p.args['sign'], str))
+        data = base64.b64decode(Payload.type_checked(p.dict['data'], str))
+        sign = base64.b64decode(Payload.type_checked(p.dict['sign'], str))
 
         # check for signature
         if not self.hs.ok or not self.hs.key.verify(sign, data):
@@ -322,7 +324,7 @@ class Discovery:
             # dispatch by packet type
             match req.type:
                 case PacketType.RPC:
-                    resp = await self.rpc.handle_request(req.data)
+                    resp = await self.rpc.handle_request(Payload.type_checked(req.data, RPCRequest))
                     resp = resp and repo.rpc(self.dev.did, resp)
                 case PacketType.Probe:
                     self.rpc.hs.reset()

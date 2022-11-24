@@ -3,6 +3,7 @@
 
 import os
 import logs
+import math
 import time
 import socket
 import struct
@@ -10,11 +11,9 @@ import asyncio
 import hexdump
 import logging
 
+from logs import Logger
 from enum import IntEnum
-from logging import Logger
-
-from typing import Any
-from typing import Optional
+from typing import AsyncIterator
 
 from asyncio import Queue
 from asyncio import Future
@@ -56,9 +55,7 @@ from config import DeviceConfiguration
 LOG_FMT         = '%(asctime)s %(name)s [%(levelname)s] %(message)s'
 LOG_LEVEL       = logging.DEBUG
 
-REQ_VER         = 2
 CAM_VER         = '1.2.1_1981'
-
 COM_RX_PORT     = 32295
 STATION_PORT    = 6282
 STATION_BIND    = '0.0.0.0'
@@ -141,7 +138,7 @@ class PacketCmd(IntEnum):
     ResetDevice                     = 0x2c
     MCUVersion                      = 0x2d
     DebugLog                        = 0x2e
-    GetSyslog                       = 0x2f
+    Syslog                          = 0x2f
     UpgradeWiFi                     = 0x30
     UpgradeDSP                      = 0x31
     SetMAC                          = 0x32
@@ -193,6 +190,26 @@ class PacketCmd(IntEnum):
     BindResult                      = 0x12e
     StaticIPAssigned                = 0x12f
 
+    @property
+    def response(self) -> 'PacketCmd':
+        match self:
+            case self.Wakeup             : return self.Wakeup
+            case self.PowerDown          : return self.PowerDown
+            case self.GetWiFiSignal      : return self.WiFiSignal
+            case self.GetBatteryStat     : return self.BatteryStat
+            case self.TimeSync           : return self.TimeSync
+            case self.GetSensitivity     : return self.Sensitivity
+            case self.DeviceInfo         : return self.DeviceInfo
+            case self.MCUVersion         : return self.MCUVersion
+            case self.DebugLog           : return self.DebugLog
+            case self.Syslog             : return self.Syslog
+            case self.GetPIRDelay        : return self.PIRDelay
+            case self.PIRQuiescentTime   : return self.PIRQuiescentTime
+            case self.GSensorSwitch      : return self.GSensorSwitch
+            case self.GSensorSensitivity : return self.GSensorSensitivity
+            case self.ControlLED         : return self.ControlLED
+            case _                       : raise ValueError('%s does not have a response' % self)
+
 class Frame:
     type    : FrameCmd
     index   : int
@@ -208,12 +225,12 @@ class Frame:
             'Frame {',
             '    type    : %s' % self.type,
             '    index   : %d' % self.index,
-            '    payload : ' + (self.payload and self._dump_payload() or '(empty)'),
+            '    payload : ' + (self._dump_payload() if self.payload else '(empty)'),
             '}'
         ])
 
     def _dump_payload(self) -> str:
-        return ('\n' + ' ' * 14).join(hexdump.hexdump(self.payload, result = 'generator'))
+        return ('\n' + ' ' * 14).join(hexdump.dumpgen(self.payload))
 
 class Packet:
     ver   : int
@@ -233,12 +250,12 @@ class Packet:
             '    ver   : %d' % self.ver,
             '    cmd   : %s (%#04x)' % (self.cmd, self.cmd),
             '    token : ' + self.token.hex(),
-            '    data  : ' + (self.data and self._dump_data() or '(empty)'),
+            '    data  : ' + (self._dump_data() if self.data else '(empty)'),
             '}',
         ])
 
     def _dump_data(self) -> str:
-        return ('\n' + ' ' * 12).join(hexdump.hexdump(self.data, result = 'generator'))
+        return ('\n' + ' ' * 12).join(hexdump.dumpgen(self.data))
 
 class FrameSerdes:
     @staticmethod
@@ -260,9 +277,17 @@ class FrameSerdes:
         rbuf = await rd.readexactly(rlen)
         return Frame(FrameCmd(ty), seq, key.decrypt(rbuf, size))
 
+    @staticmethod
+    async def iter(rd: StreamReader, key: SessionKey) -> AsyncIterator[Frame]:
+        while True:
+            try:
+                yield await FrameSerdes.read(rd, key)
+            except EOFError:
+                break
+
 class PacketSerdes:
     @staticmethod
-    async def read(rd: StreamReader, *, key: Optional[SessionKey] = None) -> Packet:
+    async def read(rd: StreamReader, *, key: SessionKey | None = None) -> Packet:
         data = await rd.readexactly(4)
         magic, = struct.unpack('I', data)
 
@@ -279,7 +304,7 @@ class PacketSerdes:
         if len(data) != 4:
             logging.getLogger('mwc11.serdes').warning(
                 'Skipping garbage data:\n' +
-                ('\n' + ' ' * 4).join(hexdump.hexdump(data[:-4], result = 'generator'))
+                ('\n' + ' ' * 4).join(hexdump.dumpgen(data[:-4]))
             )
 
         # read the remaining header data
@@ -308,7 +333,15 @@ class PacketSerdes:
         return Packet(ver, cmd, data[12:], ext + key.decrypt(rbuf, size))
 
     @staticmethod
-    def write(wr: StreamWriter, frame: Packet, *, key: Optional[SessionKey] = None):
+    async def iter(rd: StreamReader, *, key: SessionKey | None = None) -> AsyncIterator[Packet]:
+        while True:
+            try:
+                yield await PacketSerdes.read(rd, key = key)
+            except EOFError:
+                break
+
+    @staticmethod
+    def write(wr: StreamWriter, frame: Packet, *, key: SessionKey | None = None):
         mm = struct.pack('IIII16s', SENDER_MAGIC, frame.cmd, len(frame.data), frame.ver, frame.token)
         wr.write(mm + (frame.data if key is None else key.encrypt(frame.data)))
 
@@ -319,7 +352,7 @@ class FrameDemux:
     frames : Queue
 
     def __init__(self):
-        self.log    = logging.getLogger('mwc11.demux')
+        self.log    = Logger.for_name('mwc11.demux')
         self.vidx   = -1
         self.vbuf   = b''
         self.frames = Queue()
@@ -393,7 +426,7 @@ class MuxFrame:
         ])
 
     def _dump_buf(self) -> str:
-        return ('\n' + ' ' * 10).join(hexdump.hexdump(self.buf, result = 'generator'))
+        return ('\n' + ' ' * 10).join(hexdump.dumpgen(self.buf))
 
     def to_bytes(self) -> bytes:
         return struct.pack('>IB', self.ty, len(self.buf)) + self.buf
@@ -419,11 +452,11 @@ class MuxTransport(WriteTransport):
     def __init__(self, ty: MuxType, wr: StreamWriter):
         self.ty  = ty
         self.wr  = wr
-        self.log = logging.getLogger('mwc11.mux')
+        self.log = Logger.for_name('mwc11.mux')
         super().__init__(None)
 
-    def get_extra_info(self, name: str, default: Any = None):
-        return self.wr.transport.get(name, default)
+    def get_extra_info(self, name: str, default: object = None):
+        return self.wr.transport.get_extra_info(name, default)
 
     def is_closing(self):
         return self.wr.transport.is_closing()
@@ -431,7 +464,7 @@ class MuxTransport(WriteTransport):
     def close(self):
         self.wr.transport.close()
 
-    def set_write_buffer_limits(self, high: Optional[int] = None, low: Optional[int] = None):
+    def set_write_buffer_limits(self, high: int | None = None, low: int | None = None):
         self.wr.transport.set_write_buffer_limits(high, low)
 
     def get_write_buffer_size(self) -> int:
@@ -463,7 +496,7 @@ class MuxConnection:
     def __init__(self, rd: StreamReader, wr: StreamWriter):
         self.rd  = rd
         self.wr  = wr
-        self.log = logging.getLogger('mwc11.mux')
+        self.log = Logger.for_name('mwc11.mux')
         self.mux = { t: self._new_chan(t, wr) for t in MuxType }
 
     @property
@@ -520,7 +553,7 @@ class MuxConnection:
                     if req.ty not in self.mux:
                         self.log.warning('Invalid frame type %s, dropped.', req.ty)
                     else:
-                        self.log.debug('Received a packet with type %s.', req.ty.name)
+                        self.log.trace('Received a packet with type %s.', req.ty.name)
                         self.mux[req.ty][0].feed_data(req.buf)
 
 class SessionTokens:
@@ -550,45 +583,64 @@ class CommandTransport:
         self.token  = token
         self.waiter = {}
 
-    def _drop_timer(self, cmd: PacketCmd):
-        if cmd in self.waiter:
-            self.waiter.pop(cmd)[1].cancel()
-
-    def _fire_timeout(self, cmd: PacketCmd):
-        if cmd in self.waiter:
-            fut, _ = self.waiter.pop(cmd)
-            fut.cancelled() or fut.set_exception(TimeoutError)
-
-    def _send_request(self, req: Packet, resp: PacketCmd, timeout: float) -> Future[Packet]:
-        com = self.mux.writer(MuxType.ComData)
-        fut = asyncio.get_running_loop().create_future()
-        tmr = asyncio.get_running_loop().call_later(timeout, self._fire_timeout, resp)
-        self.waiter[resp] = (fut, tmr)
-        PacketSerdes.write(com, req, key = self.key)
-        fut.add_done_callback(lambda _: self._drop_timer(resp))
-        return fut
-
     def post(self, cmd: PacketCmd, *, data: bytes = b''):
-        req = Packet(REQ_VER, cmd, self.token.tx, data)
+        req = Packet(0, cmd, self.token.tx, data)
         PacketSerdes.write(self.mux.writer(MuxType.ComData), req, key = self.key)
 
-    def send(self, req: PacketCmd, resp: PacketCmd, *, data: bytes = b'', timeout: float = 1.0) -> Future[Packet]:
-        if resp in self.waiter:
-            raise RuntimeError('multiple waits on the same command: ' + str(resp))
-        else:
-            return self._send_request(Packet(REQ_VER, req, self.token.tx, data), resp, timeout)
+    def send(self, cmd: PacketCmd, *, data: bytes = b'', timeout: float = 1.0) -> Future[Packet]:
+        ret = cmd.response
+        com = self.mux.writer(MuxType.ComData)
+        req = Packet(0, cmd, self.token.tx, data)
+
+        # check for duplication
+        if ret in self.waiter:
+            raise RuntimeError('multiple waits on the same command: ' + str(ret))
+
+        # timeout routine
+        def fire_timeout():
+            val = self.waiter.pop(ret, (None, None))
+            fut, tmr = val
+
+            # check for concurrent conditions
+            if fut is None: return False
+            if tmr is None: raise  SystemError('unreachable')
+
+            # do not set exceptions on cancelled futures
+            if not fut.cancelled():
+                fut.set_exception(TimeoutError)
+
+        # register the timeout callback
+        fut = asyncio.get_running_loop().create_future()
+        tmr = asyncio.get_running_loop().call_later(timeout, fire_timeout)
+
+        # timer removal routine
+        def drop_timer(_):
+            if ret in self.waiter:
+                self.waiter.pop(ret)[1].cancel()
+
+        # transmit the packet
+        PacketSerdes.write(com, req, key = self.key)
+        fut.add_done_callback(drop_timer)
+
+        # add to waiter list
+        self.waiter[ret] = (fut, tmr)
+        return fut
+
+    def time_sync(self) -> Future[Packet]:
+        frac, sec = math.modf(time.time() + time.daylight * 3600)
+        return self.send(PacketCmd.TimeSync, data = struct.pack('II', int(sec), int(frac * 1e6)))
 
     def handle_packet(self, p: Packet) -> bool:
         cmd = p.cmd
         fut, tmr = self.waiter.pop(cmd, (None, None))
 
         # check if it is the expected packet
-        if tmr is None:
-            return False
+        if fut is None: return False
+        if tmr is None: raise  SystemError('unreachable')
 
         # stop the timer, and resolve the future
-        fut.set_result(p)
         tmr.cancel()
+        fut.set_result(p)
         return True
 
 class Channel(IntEnum):
@@ -601,8 +653,182 @@ class ChannelEvent(IntEnum):
     Connected    = 0,
     Disconnected = 1
 
-class Device:
-    online: bool
+class Properties:
+    rssi          : int
+    temperature   : int
+    battery_volt  : int
+    battery_level : int
+
+    def __init__(self):
+        self.rssi          = -1
+        self.temperature   = 0
+        self.battery_volt  = 0
+        self.battery_level = 0
+
+class Instance:
+    mac    : bytes
+    log    : Logger
+    mux    : MuxConnection
+    dev    : DeviceConfiguration
+    port   : CommandTransport
+    alive  : float
+    demux  : FrameDemux
+    props  : Properties
+    tokens : SessionTokens
+
+    def __init__(self,
+        mac    : bytes,
+        mux    : MuxConnection,
+        dev    : DeviceConfiguration,
+        tokens : SessionTokens
+    ) -> None:
+        self.mac    = mac
+        self.mux    = mux
+        self.dev    = dev
+        self.log    = Logger.for_name('mwc11.conn.' + mac.hex('-'))
+        self.port   = CommandTransport(dev.session_key, mux, tokens)
+        self.alive  = time.monotonic()
+        self.demux  = FrameDemux()
+        self.props  = Properties()
+        self.tokens = tokens
+
+    async def _cmd_heartbeat(self, p: Packet):
+        data = p.data
+        level, rssi, volt, temp = struct.unpack('I4xi2xHh94x', data)
+
+        # update properties
+        self.props.rssi = rssi
+        self.props.temperature = temp
+        self.props.battery_volt = volt
+        self.props.battery_level = level
+
+        # log the stats
+        self.log.debug('Updated: camera_misc.rssi = %d dB', rssi)
+        self.log.debug('Updated: camera_misc.temperature = %d °C', temp)
+        self.log.debug('Updated: camera_misc.battery_volt = %d mV', volt)
+        self.log.debug('Updated: camera_misc.battery_level = %d %%', level)
+
+    async def _cmd_wifi_signal(self, p: Packet):
+        self.props.rssi, = struct.unpack('i', p.data)
+        self.log.debug('Updated: camera_misc.rssi = %d dB', self.props.rssi)
+
+    async def _cmd_battery_stat(self, p: Packet):
+        data = p.data
+        level, volt = struct.unpack('II', data)
+
+        # update properties
+        self.props.battery_volt = volt
+        self.props.battery_level = level
+
+        # log the stats
+        self.log.debug('Updated: camera_misc.battery_volt = %d mV', volt)
+        self.log.debug('Updated: camera_misc.battery_level = %d %%', level)
+
+    async def _cmd_external_power(self, p: Packet):
+        if bool(struct.unpack('B', p.data)[0]):
+            self.log.info('External power was connected.')
+            self.port.post(PacketCmd.Wakeup)
+        else:
+            self.log.info('External power was disconnected.')
+            self.port.post(PacketCmd.PowerDown)
+
+    async def _cmd_push_device_uid(self, p: Packet):
+        self.dev.tag = DeviceTag.parse(p.data.rstrip(b'\x00').decode('utf-8'))
+        self.dev.save()
+        self.log.debug('Device tag was updated.')
+
+    __command_handlers__ = {
+        PacketCmd.Heartbeat         : _cmd_heartbeat,
+        PacketCmd.WiFiSignal        : _cmd_wifi_signal,
+        PacketCmd.BatteryStat       : _cmd_battery_stat,
+        PacketCmd.ExternalPower     : _cmd_external_power,
+        PacketCmd.PushDeviceUID     : _cmd_push_device_uid,
+        PacketCmd.BatteryInOutState : _cmd_external_power,
+    }
+
+    async def _sleep(self, secs: int) -> bool:
+        for _ in range(secs):
+            if not self.mux.closed:
+                await asyncio.sleep(1.0)
+            else:
+                return False
+        else:
+            return True
+
+    async def _time_sync(self):
+        while await self._sleep(60):
+            for _ in range(10):
+                try:
+                    await asyncio.wait_for(self.port.time_sync(), 5.0)
+                except TimeoutError:
+                    self.log.warning('Time-sync timeout, try again later.')
+                except ConnectionResetError:
+                    self.log.error('Losing contact with the device.')
+                    return
+                else:
+                    break
+
+    async def _keep_alive(self):
+        while await self._sleep(300):
+            try:
+                self.port.post(PacketCmd.Heartbeat)
+                self.port.post(PacketCmd.GetWiFiSignal)
+                self.port.post(PacketCmd.GetBatteryStat)
+            except ConnectionResetError:
+                self.log.error('Losing contact with the device.')
+                break
+
+    async def _handle_events(self):
+        while True:
+            try:
+                rd = self.mux.reader(MuxType.StaConn)
+                chan, event, port, addr = struct.unpack('>BBH4s', await rd.readexactly(8))
+            except EOFError:
+                break
+
+            # check the channel and event
+            try:
+                chan = Channel(chan)
+                event = ChannelEvent(event)
+            except ValueError:
+                self.log.error('Invalid event data, dropped.')
+                continue
+
+            # log the event
+            addr = socket.inet_ntop(socket.AF_INET, addr)
+            self.log.trace('Received event from %s:%d. event = %s.%s', addr, port, chan.name, event.name)
+
+            # handle the events
+            match chan, event:
+                case Channel.ComSend, ChannelEvent.Connected:
+                    self.log.debug('Update COM_SEND channel to %s:%d.', addr, port)
+                    self.tokens.update(port)
+
+    async def _handle_frames(self):
+        async for req in FrameSerdes.iter(self.mux.reader(MuxType.UdpData), self.dev.session_key):
+            if req.type == FrameCmd.Nested:
+                print(req)
+
+    async def _handle_requests(self):
+        async for req in PacketSerdes.iter(self.mux.reader(MuxType.ComData), key = self.dev.session_key):
+            if req.token != self.tokens.rx:
+                self.log.warning('Cannot verify token, dropped. packet = %s', req)
+            elif self.port.handle_packet(req):
+                self.log.debug('Received response: %s', req)
+            elif req.cmd not in self.__command_handlers__:
+                self.log.debug('Unhandled command, dropped. packet = %s', req)
+            else:
+                self.log.debug('Command received: %s', req)
+                await self.__command_handlers__[req.cmd](self, req)
+
+    async def run(self):
+        await asyncio.gather(
+            self._time_sync(),
+            self._keep_alive(),
+            self._handle_events(),
+            self._handle_frames(),
+            self._handle_requests(),
+        )
 
 class Binder:
     rnd: bytes
@@ -622,7 +848,7 @@ class Binder:
         self.mux = mux
         self.key = None
         self.rnd = os.urandom(16)
-        self.log = logging.getLogger('mwc11.bind')
+        self.log = Logger.for_name('mwc11.bind')
 
     def _mk_hash(self, did: str, psk: bytes, rand: bytes) -> str:
         key = HKDF(SHA256(), 16, did.encode('utf-8'), b'secure-proxy-auth').derive(psk)
@@ -631,6 +857,10 @@ class Binder:
     def _exec_rpc(self, req: RPCRequest, dev: DeviceConfiguration) -> RPCResponse:
         func = self.__rpc_handler__.get(req.method)
         self.log.debug('Executing RPC request: %s', req)
+
+        # must have request ID
+        if req.id is None:
+            return RPCResponse(0, error = RPCError(RPCError.Code.InvalidParameters, 'missing request ID'))
 
         # check for method name
         if func is None:
@@ -644,20 +874,28 @@ class Binder:
 
     def _exec_auth(self, req: RPCRequest, dev: DeviceConfiguration) -> RPCResponse:
         rid = req.id
-        psk = dev.tag.psk
+        tag = dev.tag
+
+        # must have request ID
+        if rid is None:
+            return RPCResponse(0, error = RPCError(RPCError.Code.InvalidParameters, 'missing request ID'))
+
+        # must have a tag
+        if tag is None:
+            return RPCResponse(rid, error = RPCError(-1, 'uninitialized'))
 
         # parse the arguments
         try:
-            did = Payload.type_checked(req.args['did'], str)
-            name = Payload.type_checked(req.args['model'], str)
-            rand = bytes.fromhex(Payload.type_checked(req.args['random_dev'], str))
+            did = Payload.type_checked(req.dict['did'], str)
+            name = Payload.type_checked(req.dict['model'], str)
+            rand = bytes.fromhex(Payload.type_checked(req.dict['random_dev'], str))
         except (KeyError, ValueError):
             self.log.error('Invalid RPC request: %s', req)
             return RPCResponse(rid, error = RPCError(RPCError.Code.InvalidParameters, "invalid args"))
 
         # compute the response hash
         resp = self.rnd.hex()
-        conf = self._mk_hash(did, psk, rand)
+        conf = self._mk_hash(did, tag.psk, rand)
         self.log.debug('Authentication from device %s. model = %s', did, name)
 
         # construct the response
@@ -669,15 +907,23 @@ class Binder:
 
     def _exec_bind(self, req: RPCRequest, dev: DeviceConfiguration) -> RPCResponse:
         rid = req.id
-        psk = dev.tag.psk
+        tag = dev.tag
+
+        # must have request ID
+        if rid is None:
+            return RPCResponse(0, error = RPCError(RPCError.Code.InvalidParameters, 'missing request ID'))
+
+        # must have a tag
+        if tag is None:
+            return RPCResponse(rid, error = RPCError(-1, 'uninitialized'))
 
         # parse the arguments
         try:
-            did = Payload.type_checked(req.args['did'], str)
-            name = Payload.type_checked(req.args['model'], str)
-            conf = Payload.type_checked(req.args['confirm_dev'], str)
-            addr = MACAddress.parse(Payload.type_checked(req.args['mac'], str))
-        except (KeyError, ValueError):
+            did = Payload.type_checked(req.dict['did'], str)
+            name = Payload.type_checked(req.dict['model'], str)
+            conf = Payload.type_checked(req.dict['confirm_dev'], str)
+            addr = MACAddress.parse(Payload.type_checked(req.dict['mac'], str))
+        except (KeyError, TypeError, ValueError):
             self.log.error('Invalid RPC request: %s', req)
             return RPCResponse(rid, error = RPCError(RPCError.Code.InvalidParameters, "invalid args"))
 
@@ -688,7 +934,7 @@ class Binder:
 
         # calculate the signature
         rand = self.rnd
-        resp = self._mk_hash(did, psk, rand)
+        resp = self._mk_hash(did, tag.psk, rand)
 
         # verify the signature
         if resp != conf:
@@ -704,19 +950,15 @@ class Binder:
         '_sync.subdev_secure_authen' : _exec_auth,
     }
 
-    async def _wait_cmd(self, *cmds: PacketCmd, key: Optional[SessionKey] = None) -> Packet:
-        while True:
-            rd = self.mux.reader(MuxType.ComData)
-            req = await PacketSerdes.read(rd, key = key)
-
-            # wait for the expected command
+    async def _wait_cmd(self, *cmds: PacketCmd, key: SessionKey | None = None) -> Packet:
+        async for req in PacketSerdes.iter(self.mux.reader(MuxType.ComData), key = key):
             if req.cmd not in cmds:
                 self.log.debug('Dropping unexpected packet: %s', req)
-                continue
-
-            # log the packet
-            self.log.debug('Received packet: %s', req)
-            return req
+            else:
+                self.log.debug('Received packet: %s', req)
+                return req
+        else:
+            raise EOFError
 
     async def bind(self, dev: DeviceConfiguration):
         req = await self._wait_cmd(PacketCmd.ExchangeBindInfo)
@@ -824,11 +1066,14 @@ class Binder:
         dev.auth_key    = akey
         dev.static_key  = StaticKey(skid)
         dev.session_key = ekey
+
+        # save the configuration
+        dev.save()
         self.log.info('Bind successful.')
 
     async def query_tag(self) -> DeviceTag:
-        PacketSerdes.write(self.mux.writer(MuxType.ComData), Packet(REQ_VER, PacketCmd.GetConfigInfo, bytes(16)))
-        PacketSerdes.write(self.mux.writer(MuxType.ComData), Packet(REQ_VER, PacketCmd.SystemStart, bytes(16)))
+        PacketSerdes.write(self.mux.writer(MuxType.ComData), Packet(0, PacketCmd.GetConfigInfo, bytes(16)))
+        PacketSerdes.write(self.mux.writer(MuxType.ComData), Packet(0, PacketCmd.SystemStart, bytes(16)))
 
         # attempt to get a PushDeviceUID packet
         try:
@@ -856,7 +1101,7 @@ class Station:
     def __init__(self, cfg: Configuration):
         self.cfg = cfg
         self.run = set()
-        self.log = logging.getLogger('mwc11')
+        self.log = Logger.for_name('mwc11')
 
     async def serve_forever(self, host: str = STATION_BIND, port: int = STATION_PORT):
         srv = await asyncio.start_server(self._serve_connection, host = host, port = port)
@@ -921,11 +1166,22 @@ class Station:
                 await Binder(mac, mux).bind(dev)
             except Exception as e:
                 self.log.error('Cannot bind device "%s". Error: %s', mac.hex(), e)
-            else:
-                dev.save()
+                mux.close()
+                return
 
-        # TODO: device handle logic
-        print(mac, local, remote)
+        # create a new instance
+        cam = Instance(mac, mux, dev, SessionTokens(dev.session_key, local, remote))
+        self.log.info('Connection established from "%s".', mac.hex(':'))
+
+        # serve the instance
+        try:
+            await cam.run()
+        except Exception:
+            self.log.exception('Unhandled error from connection "%s":', mac.hex(':'))
+
+        # close the connection multiplexer
+        self.log.info('Connection from "%s" closed.', mac.hex(':'))
+        mux.close()
 
 async def main():
     await Station(ConfigurationFile.load('mwc11.json')).serve_forever()

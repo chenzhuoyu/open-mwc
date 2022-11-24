@@ -11,9 +11,10 @@ import binascii
 
 from enum import IntEnum
 from urllib import parse
+from functools import cached_property
 
-from typing import Any
-from typing import Type
+from typing import cast
+from typing import TypeVar
 from typing import Callable
 from typing import Optional
 from typing import Sequence
@@ -30,6 +31,7 @@ from cryptography.hazmat.primitives.asymmetric.ec import SECP256R1
 from cryptography.hazmat.primitives.asymmetric.ec import SECP384R1
 from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurve
 
+T            = TypeVar('T')
 HEADER_SIZE  = 32
 HEADER_MAGIC = 0x2131
 
@@ -48,11 +50,11 @@ class Payload:
         raise NotImplementedError
 
     @staticmethod
-    def type_checked(v: Any, ty: Type) -> Any:
+    def type_checked(v: object, ty: type[T]) -> T:
         if not isinstance(v, ty):
             raise ValueError('invalid type: expect %r, got %r' % (ty, type(v)))
         else:
-            return v
+            return cast(ty, v)
 
 class MACAddress:
     @staticmethod
@@ -210,14 +212,14 @@ class DeviceInfo:
 
 class RPCError(Exception):
     code    : int
-    data    : Any
+    data    : object
     message : str
 
     class Code(IntEnum):
         NoSuchProperty      = -4003
         InvalidParameters   = -32602
 
-    def __init__(self, code: int, message: str, *, data: Any = None):
+    def __init__(self, code: int, message: str, *, data: object = None):
         self.code    = code
         self.data    = data
         self.message = message
@@ -228,27 +230,39 @@ class RPCError(Exception):
         else:
             return '[error %d] %s: %r' % (self.code, self.message, self.data)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         if self.data is None:
             return { 'code': self.code, 'message': self.message }
         else:
             return { 'code': self.code, 'message': self.message, 'data': self.data }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> 'RPCError':
+    def from_dict(cls, data: dict[str, object]) -> 'RPCError':
         code = Payload.type_checked(data['code'], int)
         message = Payload.type_checked(data['message'], str)
         return cls(code, message, data = data.get('data'))
 
 class RPCRequest(Payload):
     id     : Optional[int]
-    args   : Any
+    args   : object
     method : str
 
-    def __init__(self, method: str, *, id: Optional[int] = None, args: Any = None):
+    def __init__(self, method: str, *, id: Optional[int] = None, args: object = None):
         self.id     = id
         self.args   = args
         self.method = method
+
+    @cached_property
+    def text(self) -> str:
+        return Payload.type_checked(self.args, str)
+
+    @cached_property
+    def list(self) -> list:
+        return Payload.type_checked(self.args, list)
+
+    @cached_property
+    def dict(self) -> dict[str, object]:
+        return Payload.type_checked(self.args, dict)
 
     @property
     def _readable_args(self) -> str:
@@ -281,9 +295,9 @@ class RPCRequest(Payload):
         return self.to_json().encode('utf-8')
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> 'RPCRequest':
-        rid = Payload.type_checked(data.get('id', None), (int, None))
-        args = Payload.type_checked(data.get('params', {}), (str, list, dict))
+    def from_dict(cls, data: 'dict[str, object]') -> 'RPCRequest':
+        rid = Payload.type_checked(data.get('id', None), int | None)
+        args = Payload.type_checked(data.get('params', {}), str | list | dict)
         method = Payload.type_checked(data['method'], str)
 
         # handle the special case of an empty string
@@ -300,13 +314,25 @@ class RPCRequest(Payload):
 
 class RPCResponse(Payload):
     id    : int
-    data  : Any
+    data  : object
     error : Optional[RPCError]
 
-    def __init__(self, id: int, *, data: Any = None, error: Optional[RPCError] = None):
+    def __init__(self, id: int, *, data: object = None, error: Optional[RPCError] = None):
         self.id    = id
         self.data  = data
         self.error = error
+
+    @cached_property
+    def text(self) -> str:
+        return Payload.type_checked(self.data, str)
+
+    @cached_property
+    def list(self) -> list:
+        return Payload.type_checked(self.data, list)
+
+    @cached_property
+    def dict(self) -> dict[str, object]:
+        return Payload.type_checked(self.data, dict[str, object])
 
     @property
     def _readable_data(self) -> str:
@@ -351,13 +377,13 @@ class RPCResponse(Payload):
             raise self.error
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> 'RPCRequest':
+    def from_dict(cls, data: 'dict[str, object]') -> 'RPCResponse':
         rid = Payload.type_checked(data['id'], int)
         error = Payload.type_checked(data.get('error', {}), dict)
-        return cls(rid, data = data.get('result'), error = error and RPCError.from_dict(error) or None)
+        return cls(rid, data = data.get('result'), error = RPCError.from_dict(error) if error else None)
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> 'RPCRequest':
+    def from_bytes(cls, data: bytes) -> 'RPCResponse':
         return cls.from_dict(Payload.type_checked(json.loads(data.rstrip(b'\x00').decode('utf-8')), dict))
 
 class PacketType(IntEnum):
@@ -472,7 +498,7 @@ class Packet:
 
         # probe packet does not have checksum
         if ty == PacketType.Probe:
-            return Packet(ts, did, b'', ty, cksum)
+            return Packet(ts, did, None, ty, cksum)
 
         # at this point, the key is required
         if key is None:
@@ -489,17 +515,17 @@ class Packet:
 
         # no payload data
         if ty == PacketType.Keepalive:
-            return cls(ts, did, b'', ty, cksum)
+            return cls(ts, did, None, ty, cksum)
 
         # decrypt the payload
-        data = data[HEADER_SIZE:]
-        data = json.loads(key.decrypt(data).rstrip(b'\x00').decode('utf-8'))
+        data = key.decrypt(data[HEADER_SIZE:]).rstrip(b'\x00')
+        body = Payload.type_checked(json.loads(data.decode('utf-8')), dict)
 
         # check if it is a request
-        if 'method' in data:
-            return cls(ts, did, RPCRequest.from_dict(data), ty, cksum)
+        if 'method' in body:
+            return cls(ts, did, RPCRequest.from_dict(body), ty, cksum)
         else:
-            return cls(ts, did, RPCResponse.from_dict(data), ty, cksum)
+            return cls(ts, did, RPCResponse.from_dict(body), ty, cksum)
 
     @staticmethod
     def probe_bytes() -> bytes:

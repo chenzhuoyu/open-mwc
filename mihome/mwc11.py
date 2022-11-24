@@ -10,10 +10,8 @@ import hexdump
 import logging
 
 from enum import IntEnum
-from logging import Logger
-
-from typing import Any
 from typing import Optional
+from logging import Logger
 
 from asyncio import Queue
 from asyncio import Future
@@ -208,12 +206,12 @@ class Frame:
             'Frame {',
             '    type    : %s' % self.type,
             '    index   : %d' % self.index,
-            '    payload : ' + (self.payload and self._dump_payload() or '(empty)'),
+            '    payload : ' + (self._dump_payload() if self.payload else '(empty)'),
             '}'
         ])
 
     def _dump_payload(self) -> str:
-        return ('\n' + ' ' * 14).join(hexdump.hexdump(self.payload, result = 'generator'))
+        return ('\n' + ' ' * 14).join(hexdump.dumpgen(self.payload))
 
 class Packet:
     ver   : int
@@ -233,12 +231,12 @@ class Packet:
             '    ver   : %d' % self.ver,
             '    cmd   : %s (%#04x)' % (self.cmd, self.cmd),
             '    token : ' + self.token.hex(),
-            '    data  : ' + (self.data and self._dump_data() or '(empty)'),
+            '    data  : ' + (self._dump_data() if self.data else '(empty)'),
             '}',
         ])
 
     def _dump_data(self) -> str:
-        return ('\n' + ' ' * 12).join(hexdump.hexdump(self.data, result = 'generator'))
+        return ('\n' + ' ' * 12).join(hexdump.dumpgen(self.data))
 
 class FrameSerdes:
     @staticmethod
@@ -279,7 +277,7 @@ class PacketSerdes:
         if len(data) != 4:
             logging.getLogger('mwc11.serdes').warning(
                 'Skipping garbage data:\n' +
-                ('\n' + ' ' * 4).join(hexdump.hexdump(data[:-4], result = 'generator'))
+                ('\n' + ' ' * 4).join(hexdump.dumpgen(data[:-4]))
             )
 
         # read the remaining header data
@@ -388,12 +386,12 @@ class MuxFrame:
         return '\n'.join([
             'MuxFrame {',
             '    ty  = %s' % self.ty,
-            '    buf = %s' % (self.buf and self._dump_buf() or '(empty)'),
+            '    buf = %s' % (self._dump_buf() if self.buf else '(empty)'),
             '}',
         ])
 
     def _dump_buf(self) -> str:
-        return ('\n' + ' ' * 10).join(hexdump.hexdump(self.buf, result = 'generator'))
+        return ('\n' + ' ' * 10).join(hexdump.dumpgen(self.buf))
 
     def to_bytes(self) -> bytes:
         return struct.pack('>IB', self.ty, len(self.buf)) + self.buf
@@ -422,8 +420,8 @@ class MuxTransport(WriteTransport):
         self.log = logging.getLogger('mwc11.mux')
         super().__init__(None)
 
-    def get_extra_info(self, name: str, default: Any = None):
-        return self.wr.transport.get(name, default)
+    def get_extra_info(self, name: str, default: object = None):
+        return self.wr.transport.get_extra_info(name, default)
 
     def is_closing(self):
         return self.wr.transport.is_closing()
@@ -550,45 +548,60 @@ class CommandTransport:
         self.token  = token
         self.waiter = {}
 
-    def _drop_timer(self, cmd: PacketCmd):
-        if cmd in self.waiter:
-            self.waiter.pop(cmd)[1].cancel()
-
-    def _fire_timeout(self, cmd: PacketCmd):
-        if cmd in self.waiter:
-            fut, _ = self.waiter.pop(cmd)
-            fut.cancelled() or fut.set_exception(TimeoutError)
-
-    def _send_request(self, req: Packet, resp: PacketCmd, timeout: float) -> Future[Packet]:
-        com = self.mux.writer(MuxType.ComData)
-        fut = asyncio.get_running_loop().create_future()
-        tmr = asyncio.get_running_loop().call_later(timeout, self._fire_timeout, resp)
-        self.waiter[resp] = (fut, tmr)
-        PacketSerdes.write(com, req, key = self.key)
-        fut.add_done_callback(lambda _: self._drop_timer(resp))
-        return fut
-
     def post(self, cmd: PacketCmd, *, data: bytes = b''):
         req = Packet(REQ_VER, cmd, self.token.tx, data)
         PacketSerdes.write(self.mux.writer(MuxType.ComData), req, key = self.key)
 
-    def send(self, req: PacketCmd, resp: PacketCmd, *, data: bytes = b'', timeout: float = 1.0) -> Future[Packet]:
+    def send(self, cmd: PacketCmd, resp: PacketCmd, *, data: bytes = b'', timeout: float = 1.0) -> Future[Packet]:
+        com = self.mux.writer(MuxType.ComData)
+        req = Packet(0, cmd, self.token.tx, data)
+
+        # check for duplication
         if resp in self.waiter:
             raise RuntimeError('multiple waits on the same command: ' + str(resp))
-        else:
-            return self._send_request(Packet(REQ_VER, req, self.token.tx, data), resp, timeout)
+
+        # timeout routine
+        def fire_timeout():
+            val = self.waiter.pop(resp, (None, None))
+            fut, tmr = val
+
+            # check for concurrent conditions
+            if fut is None: return False
+            if tmr is None: raise  SystemError('unreachable')
+
+            # do not set exceptions on cancelled futures
+            if not fut.cancelled():
+                fut.set_exception(TimeoutError)
+
+        # register the timeout callback
+        fut = asyncio.get_running_loop().create_future()
+        tmr = asyncio.get_running_loop().call_later(timeout, fire_timeout)
+
+        # timer removal routine
+        def drop_timer(_):
+            if resp in self.waiter:
+                self.waiter.pop(resp)[1].cancel()
+
+        # transmit the packet
+        PacketSerdes.write(com, req, key = self.key)
+        fut.add_done_callback(drop_timer)
+
+        # add to waiter list
+        self.waiter[resp] = (fut, tmr)
+        return fut
+
 
     def handle_packet(self, p: Packet) -> bool:
         cmd = p.cmd
         fut, tmr = self.waiter.pop(cmd, (None, None))
 
         # check if it is the expected packet
-        if tmr is None:
-            return False
+        if fut is None: return False
+        if tmr is None: raise  SystemError('unreachable')
 
         # stop the timer, and resolve the future
-        fut.set_result(p)
         tmr.cancel()
+        fut.set_result(p)
         return True
 
 class Channel(IntEnum):
@@ -688,7 +701,7 @@ class Connection:
         while True:
             try:
                 rd = self.mux.reader(MuxType.StaConn)
-                chan, event, port, addr = struct.unpack('BBH4s', await rd.readexactly(8))
+                chan, event, port, addr = struct.unpack('>BBH4s', await rd.readexactly(8))
             except EOFError:
                 break
 
