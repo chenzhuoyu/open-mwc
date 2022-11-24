@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import gzip
 import logs
 import json
 import asyncio
@@ -8,9 +9,13 @@ import asyncio
 from yarl import URL
 from logs import Logger
 from http import HTTPStatus
+
+from itertools import chain
 from functools import cached_property
 
+from typing import overload
 from typing import Callable
+from typing import Iterator
 from typing import Coroutine
 from typing import AsyncIterator
 
@@ -18,6 +23,8 @@ from asyncio import StreamReader
 from asyncio import StreamWriter
 from asyncio import AbstractEventLoop
 
+MAX_HDR  = 1024
+MAX_REQ  = 65536
 SRV_PORT = 10554
 SRV_HOST = '0.0.0.0'
 
@@ -27,33 +34,95 @@ class EmptyStreamReader(StreamReader):
         self.feed_eof()
 
 class Headers:
-    data: dict[str, tuple[str, object]]
+    data: dict[
+        str,
+        tuple[str, str],
+    ]
 
-    def __init__(self, data: dict[str, object] | None = None, **kwargs):
-        self.data = { k.lower(): (k, v) for k, v in data or {} }
-        self.data.update(**kwargs)
+    def __init__(self, data: 'Headers | dict[str, str] | None' = None, **kwargs):
+        self.data = {
+            k.lower(): (k, v)
+            for k, v in chain((data or {}).items(), kwargs.items())
+        }
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __bool__(self) -> bool:
+        return bool(self.data)
+
+    def __iter__(self) -> Iterator[str]:
+        return self.keys()
+
+    def __delitem__(self, name: str):
+        del self.data[name.lower()]
+
+    def __getitem__(self, name: str) -> str:
+        _, val = self.data[name.lower()]
+        return val
+
+    def __setitem__(self, name: str, value: str):
+        self.data[name.lower()] = (name, value)
+
+    def __contains__(self, name: str) -> bool:
+        return name.lower() in self.data
+
+    @overload
+    def get(self, name: str) -> str | None:
+        ...
+
+    @overload
+    def get(self, name: str, default: str) -> str:
+        ...
+
+    def get(self, name: str, default: str | None = None) -> str | None:
+        _, val = self.data.get(name.lower(), (None, default))
+        return val
+
+    @overload
+    def pop(self, name: str) -> str | None:
+        ...
+
+    @overload
+    def pop(self, name: str, default: str) -> str:
+        ...
+
+    def pop(self, name: str, default: str | None = None) -> str | None:
+        _, val = self.data.pop(name.lower(), (None, default))
+        return val
+
+    def keys(self) -> Iterator[str]:
+        for key, _ in self.data.values():
+            yield key
+
+    def items(self) -> Iterator[tuple[str, str]]:
+        yield from self.data.values()
+
+    def values(self) -> Iterator[str]:
+        for _, val in self.data.values():
+            yield val
 
 class Request:
     uri     : URL
     body    : StreamReader
     method  : str
-    headers : dict[str, str]
+    headers : Headers
 
     def __init__(self,
         method  : str,
         uri     : URL,
         *,
         body    : StreamReader | None = None,
-        headers : dict[str, str] | None = None
+        headers : Headers | None = None
     ):
         self.uri     = uri
         self.body    = body or EmptyStreamReader()
         self.method  = method
-        self.headers = headers or {}
+        self.headers = headers or Headers()
 
     @cached_property
     def cseq(self) -> int:
-        return int(self.headers.get('CSeq', 1))
+        return int(self.headers.get('CSeq', '0'))
 
     def __repr__(self) -> str:
         return '\n'.join([
@@ -67,34 +136,33 @@ class Request:
 
     def reply(self,
         *,
-        status  : HTTPStatus               = HTTPStatus.OK,
-        body    : object                   = b'',
-        headers : dict[str, object] | None = None,
+        status  : HTTPStatus            = HTTPStatus.OK,
+        body    : object                = b'',
+        headers : dict[str, str] | None = None,
     ) -> 'Response':
         return Response(
             body    = body,
             status  = status,
-            headers = { **(headers or {}), 'CSeq': self.cseq }
+            headers = {
+                **(headers or {}),
+                'CSeq': str(self.cseq),
+            }
         )
 
 class Response:
     body    : bytes
     status  : HTTPStatus
-    headers : dict[str, object]
+    headers : Headers
 
     def __init__(self,
         *,
-        body    : object                   = b'',
-        status  : HTTPStatus               = HTTPStatus.OK,
-        headers : dict[str, object] | None = None,
+        body    : object                = b'',
+        status  : HTTPStatus            = HTTPStatus.OK,
+        headers : dict[str, str] | None = None,
     ):
         self.body    = self.to_bytes(body)
         self.status  = status
-        self.headers = headers or {}
-
-    @property
-    def has_content_length(self) -> bool:
-        return any(k.lower() == 'content-length' for k in self.headers)
+        self.headers = Headers(headers or {})
 
     def __repr__(self) -> str:
         return '\n'.join([
@@ -173,19 +241,21 @@ class RTSP:
         if len(vals) != 3 or vals[2] != 'RTSP/1.0':
             raise cls.Error(HTTPStatus.BAD_REQUEST, 'invalid first line')
 
-        # extract the path
-        hdrs = {}
-        path = vals[1]
-
         # parse the URL
         try:
-            uri = URL(path)
+            uri = URL(vals[1])
         except ValueError:
             raise cls.Error(HTTPStatus.BAD_REQUEST, 'invalid URL') from None
 
         # check the URL
         if uri.scheme != 'rtsp':
             raise cls.Error(HTTPStatus.NOT_FOUND, 'invalid URL scheme')
+
+        # header buffer
+        nhdr = 0
+        rlen = 0
+        comp = False
+        hdrs = Headers()
 
         # parse the headers
         while not rd.at_eof():
@@ -200,13 +270,52 @@ class RTSP:
             if len(item) != 2:
                 raise cls.Error(HTTPStatus.BAD_REQUEST, 'invalid header')
 
+            # check for header sizes
+            if nhdr >= MAX_HDR or len(line) > MAX_REQ:
+                raise cls.Error(HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE)
+
             # add to headers
-            key, value = item
-            hdrs[key.strip().lower()] = value.strip()
+            nhdr += 1
+            name, value = item
+            hdrs[name.strip()] = value.strip()
+
+            # parse the content length
+            if name.lower() == 'content-length':
+                try:
+                    rlen = int(value)
+                except ValueError:
+                    raise cls.Error(HTTPStatus.BAD_REQUEST, 'invalid Content-Length') from None
+
+            # save the content encoding
+            if name.lower() == 'content-encoding':
+                if value == 'gzip':
+                    comp = True
+                else:
+                    raise cls.Error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, 'unsupported Content-Encoding')
+
+        # no request body
+        if not rlen:
+            return Request(vals[0], uri, headers = hdrs)
+
+        # limit the request length
+        if rlen > MAX_REQ:
+            raise cls.Error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, 'request too large')
+
+        # read the body
+        body = StreamReader()
+        rbuf = await rd.readexactly(rlen)
+
+        # feed into the reader, decompress as needed
+        body.feed_data(gzip.decompress(rbuf) if comp else rbuf)
+        body.feed_eof()
 
         # construct the request
-        method, _, _ = vals
-        return Request(method, uri, body = rd, headers = hdrs)
+        return Request(
+            uri     = uri,
+            body    = body,
+            method  = vals[0],
+            headers = hdrs,
+        )
 
     @classmethod
     async def iter(cls, rd: StreamReader) -> AsyncIterator[Error | Request]:
@@ -221,20 +330,25 @@ class RTSP:
 
     @classmethod
     def write(cls, wr: StreamWriter, resp: Response):
-        nb = False
+        ce = resp.headers.pop('Content-Encoding')
         wb = [b'RTSP/1.0 %d %s\r\n' % (resp.status.value, resp.status.phrase.encode('utf-8'))]
+
+        # check for content encoding
+        if ce is not None:
+            if resp.body and ce == 'gzip':
+                resp.body = gzip.compress(resp.body)
+                resp.headers['Content-Encoding'] = 'gzip'
+
+        # set the content length as needed
+        if resp.body:
+            resp.headers['Content-Length'] = str(len(resp.body))
 
         # add all the headers
         for k, v in resp.headers.items():
-            nb |= k.lower() == 'content-length'
             wb.append(k.encode('utf-8'))
             wb.append(b': ')
             wb.append(Response.to_bytes(v))
             wb.append(b'\r\n')
-
-        # add content length as needed
-        if not nb and resp.body:
-            wb.append(b'content-length: %d\r\n' % len(resp.body))
 
         # send the response to output
         wb.append(b'\r\n')
@@ -256,22 +370,29 @@ class StreamingServer:
 
     async def _stream_play(self, req: Request) -> Response:
         print(req)
-        return Response(body = 'hello, world')
+        return req.reply(body = 'hello, world')
 
     async def _stream_setup(self, req: Request) -> Response:
         print(req)
-        return Response(body = 'hello, world')
+        return req.reply(body = 'hello, world')
 
     async def _stream_options(self, req: Request) -> Response:
-        return req.reply(headers = { 'Public': 'DESCRIBE, SETUP, PLAY, TEARDOWN' })
+        return req.reply(headers = {
+            'Public': ', '.join([
+                'DESCRIBE',
+                'SETUP',
+                'PLAY',
+                'TEARDOWN',
+            ]),
+        })
 
     async def _stream_teardown(self, req: Request) -> Response:
         print(req)
-        return Response(body = 'hello, world')
+        return req.reply(body = 'hello, world')
 
     async def _stream_describe(self, req: Request) -> Response:
         print(req)
-        return Response(body = 'hello, world')
+        return req.reply(body = 'hello, world')
 
     __routes__: dict[tuple[str, str], Callable[['StreamingServer', Request], Coroutine[object, object, Response]]] = {
         ('GET'      , '/mwc11/snapshot'): _image_take,
@@ -346,6 +467,7 @@ class StreamingServer:
 
     async def run(self):
         srv = await asyncio.start_server(self._handle_connection, self.host, self.port)
+        self.log.info('RTSP Server started at address %s:%d', self.host, self.port)
         await srv.serve_forever()
 
 async def main():
