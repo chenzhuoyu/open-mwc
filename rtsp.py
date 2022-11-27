@@ -917,6 +917,13 @@ class StreamingServer(SupportsAuthenticationContext):
     def authentication_context(self) -> AuthenticationContext:
         return self.ctx.authentication_context()
 
+    async def _kill_all(self, addr: tuple[str, int]):
+        for sink in self.conn.pop(addr):
+            del self.sink[sink.ssid]
+            del self.link[sink.addr, sink.rtp_port]
+            del self.link[sink.addr, sink.rtcp_port]
+            await sink.stop()
+
     @Authenticator.digest
     async def _image_take(self, _: Request) -> object:
         return 'hello, world'
@@ -1027,8 +1034,8 @@ class StreamingServer(SupportsAuthenticationContext):
         })
 
     async def _stream_teardown(self, req: Request) -> object:
-        print(req)
-        return req.reply(body = 'hello, world')
+        await self._kill_all(req.remote)
+        return req.reply()
 
     async def _stream_describe(self, req: Request) -> object:
         sdp = SDP()
@@ -1143,13 +1150,7 @@ class StreamingServer(SupportsAuthenticationContext):
             self.log.exception('Unhandled exception:')
 
         # kill all the stream sink associated with this connection
-        for sink in self.conn.pop(addr):
-            self.sink.pop(sink.ssid)
-            self.link.pop((sink.addr, sink.rtp_port))
-            self.link.pop((sink.addr, sink.rtcp_port))
-            await sink.stop()
-
-        # close the writer
+        await self._kill_all(addr)
         self.log.debug('Connection from %s:%d closed.', *addr)
         wr.close()
 
