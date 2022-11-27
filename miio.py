@@ -16,7 +16,6 @@ from functools import cached_property
 from typing import cast
 from typing import TypeVar
 from typing import Callable
-from typing import Optional
 from typing import Sequence
 
 from cryptography.hazmat.primitives.hmac import HMAC
@@ -243,11 +242,11 @@ class RPCError(Exception):
         return cls(code, message, data = data.get('data'))
 
 class RPCRequest(Payload):
-    id     : Optional[int]
+    id     : int | None
     args   : object
     method : str
 
-    def __init__(self, method: str, *, id: Optional[int] = None, args: object = None):
+    def __init__(self, method: str, *, id: int | None = None, args: object = None):
         self.id     = id
         self.args   = args
         self.method = method
@@ -315,9 +314,9 @@ class RPCRequest(Payload):
 class RPCResponse(Payload):
     id    : int
     data  : object
-    error : Optional[RPCError]
+    error : RPCError | None
 
-    def __init__(self, id: int, *, data: object = None, error: Optional[RPCError] = None):
+    def __init__(self, id: int, *, data: object = None, error: RPCError | None = None):
         self.id    = id
         self.data  = data
         self.error = error
@@ -394,7 +393,7 @@ class PacketType(IntEnum):
 class Packet:
     ts    : int
     did   : int
-    data  : Optional[Payload]
+    data  : Payload | None
     type  : PacketType
     token : bytes
 
@@ -418,12 +417,12 @@ class Packet:
         def sync(self, ts: int):
             self.ts = time.monotonic() - ts / 1000
 
-        def parse(self, data: bytes, *, key: Optional[Key] = None) -> 'Packet':
+        def parse(self, data: bytes, *, key: Key | None = None) -> 'Packet':
             ret = Packet.parse(data, key = key)
             self.sync(ret.ts)
             return ret
 
-    def __init__(self, ts: int, did: int, data: Optional[Payload], type: PacketType, token: bytes):
+    def __init__(self, ts: int, did: int, data: Payload | None, type: PacketType, token: bytes):
         self.ts    = ts
         self.did   = did
         self.data  = data
@@ -472,7 +471,7 @@ class Packet:
         return bytes(buf)
 
     @classmethod
-    def parse(cls, data: bytes, *, key: Optional[Key] = None) -> 'Packet':
+    def parse(cls, data: bytes, *, key: Key | None = None) -> 'Packet':
         hdr = data[:HEADER_SIZE]
         magic, size, did, ts, cksum = struct.unpack('>HHqi16s', hdr)
 

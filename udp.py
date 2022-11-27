@@ -4,7 +4,7 @@
 import asyncio
 
 from typing import cast
-from typing import Optional
+from functools import cached_property
 
 from asyncio import Queue
 from asyncio import DatagramProtocol
@@ -29,12 +29,20 @@ class UdpSocket:
         self.proto  = proto
         self.closed = False
 
+    @cached_property
+    def local_addr(self) -> tuple[str, int]:
+        return self.port.get_extra_info('sockname')
+
+    @cached_property
+    def remote_addr(self) -> tuple[str, int]:
+        return self.port.get_extra_info('peername')
+
     def close(self):
         if not self.closed:
             self.port.close()
             self.closed = True
 
-    def sendto(self, buf: bytes, addr: Optional[tuple[str, int]] = None):
+    def sendto(self, buf: bytes, addr: tuple[str, int] | None = None):
         if self.closed:
             raise ConnectionError('send to closed socket')
         else:
