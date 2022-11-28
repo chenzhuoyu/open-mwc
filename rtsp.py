@@ -6,6 +6,8 @@ import gzip
 import logs
 import json
 import base64
+import struct
+import hexdump
 import hashlib
 import asyncio
 
@@ -304,6 +306,348 @@ class SDP(Response.Serializable):
 
     def headers(self) -> Headers:
         return Headers({ 'Content-Type': self.content_type })
+
+class RTCP:
+    class Type(IntEnum):
+        SR   = 200
+        RR   = 201
+        SDES = 202
+        BYE  = 203
+        APP  = 204
+
+    class Packet(Protocol):
+        def encode(self) -> tuple['RTCP.Type', int, bytes]:
+            ...
+
+        @classmethod
+        def parse(cls, _: int, buf: memoryview) -> 'RTCP.Packet':
+            ...
+
+    class Report(NamedTuple):
+        ssrc       : int
+        frac_lost  : int
+        total_lost : int
+        max_seq    : int
+        jitter     : int
+        lsr        : int
+        dlsr       : int
+
+        def __repr__(self) -> str:
+            return '\n'.join([
+                'RTCP.Report {',
+                '    ssrc       = %08x' % self.ssrc,
+                '    frac_lost  = %d' % self.frac_lost,
+                '    total_lost = %d' % self.total_lost,
+                '    max_seq    = %d' % self.max_seq,
+                '    jitter     = %d' % self.jitter,
+                '    lsr        = %d' % self.lsr,
+                '    dlsr       = %d' % self.dlsr,
+                '}',
+            ])
+
+        def encode(self) -> bytes:
+            lost = ((self.frac_lost & 0xff) << 24) | (self.total_lost & 0xffffff)
+            return struct.pack('>IIIIII', self.ssrc, lost, self.max_seq, self.jitter, self.lsr, self.dlsr)
+
+        @classmethod
+        def parse(cls, buf: memoryview) -> tuple['RTCP.Report', memoryview]:
+            ssrc, lost, seq, jitter, lsr, dlsr = struct.unpack('>IIIIII', buf[:24])
+            return cls(ssrc, lost >> 24, lost & 0xffffff, seq, jitter, lsr, dlsr), buf[24:]
+
+    class SR(Packet):
+        ssrc         : int
+        ntp_ts       : int
+        rtp_ts       : int
+        packet_count : int
+        octet_count  : int
+        reports      : list['RTCP.Report']
+        extensions   : bytes
+
+        def __init__(self,
+            ssrc         : int,
+            ntp_ts       : int,
+            rtp_ts       : int,
+            packet_count : int,
+            octet_count  : int,
+            reports      : list['RTCP.Report'],
+            extensions   : bytes,
+        ):
+            self.ssrc         = ssrc
+            self.ntp_ts       = ntp_ts
+            self.rtp_ts       = rtp_ts
+            self.reports      = reports
+            self.extensions   = extensions
+            self.octet_count  = octet_count
+            self.packet_count = packet_count
+
+        def __repr__(self) -> str:
+            return '\n'.join([
+                'RTCP.SR {',
+                '    ssrc         = %08x' % self.ssrc,
+                '    ntp_ts       = %d' % self.ntp_ts,
+                '    rtp_ts       = %d' % self.rtp_ts,
+                '    packet_count = %d' % self.packet_count,
+                '    octet_count  = %d' % self.octet_count,
+                '    records      = [',
+                *(
+                    ' ' * 8 + v
+                    for r in self.reports
+                    for v in repr(r).splitlines()
+                ),
+                '    ]',
+                '    extensions   = %s' % (
+                    ('\n' + ' ' * 19).join(hexdump.dumpgen(self.extensions))
+                    if self.extensions
+                    else '(empty)'
+                ),
+                '}',
+            ])
+
+        def _encode_body(self) -> bytes:
+            return b''.join([
+                struct.pack('>IQIII', self.ssrc, self.ntp_ts, self.rtp_ts, self.packet_count, self.octet_count),
+                *(v.encode() for v in self.reports),
+                self.extensions,
+            ])
+
+        def encode(self) -> tuple['RTCP.Type', int, bytes]:
+            if len(self.extensions) & 3:
+                raise ValueError('SR extension length must be multiples of 4')
+            else:
+                return RTCP.Type.SR, len(self.reports), self._encode_body()
+
+        @classmethod
+        def parse(cls, rc: int, buf: memoryview) -> 'RTCP.SR':
+            rem, rec = buf[24:], []
+            ssrc, ntp, rtp, nb, np = struct.unpack('>IQIII', buf[:24])
+
+            # parse each report
+            for _ in range(rc):
+                val, rem = RTCP.Report.parse(rem)
+                rec.append(val)
+
+            # check for extensions
+            if not rem:
+                return cls(ssrc, ntp, rtp, np, nb, rec, b'')
+            else:
+                return cls(ssrc, ntp, rtp, np, nb, rec, bytes(rem))
+
+    class RR(Packet):
+        ssrc       : int
+        reports    : list['RTCP.Report']
+        extensions : bytes
+
+        def __init__(self,
+            ssrc       : int,
+            reports    : list['RTCP.Report'],
+            extensions : bytes,
+        ):
+            self.ssrc       = ssrc
+            self.reports    = reports
+            self.extensions = extensions
+
+        def __repr__(self) -> str:
+            return '\n'.join([
+                'RTCP.RR {',
+                '    ssrc         = %08x' % self.ssrc,
+                '    records      = [',
+                *(
+                    ' ' * 8 + v
+                    for r in self.reports
+                    for v in repr(r).splitlines()
+                ),
+                '    ]',
+                '    extensions   = %s' % (
+                    ('\n' + ' ' * 19).join(hexdump.dumpgen(self.extensions))
+                    if self.extensions
+                    else '(empty)'
+                ),
+                '}',
+            ])
+
+        def _encode_body(self) -> bytes:
+            return b''.join([
+                struct.pack('>I', self.ssrc),
+                *(v.encode() for v in self.reports),
+                self.extensions
+            ])
+
+        def encode(self) -> tuple['RTCP.Type', int, bytes]:
+            if len(self.extensions) & 3:
+                raise ValueError('RR extension length must be multiples of 4')
+            else:
+                return RTCP.Type.RR, len(self.reports), self._encode_body()
+
+        @classmethod
+        def parse(cls, rc: int, buf: memoryview) -> 'RTCP.RR':
+            rec = []
+            rem = buf[4:]
+            ssrc, = struct.unpack('>I', buf[:4])
+
+            # parse each report
+            for _ in range(rc):
+                val, rem = RTCP.Report.parse(rem)
+                rec.append(val)
+
+            # check for extensions
+            if not rem:
+                return cls(ssrc, rec, b'')
+            else:
+                return cls(ssrc, rec, bytes(rem))
+
+    class SDES(Packet):
+        def encode(self) -> tuple['RTCP.Type', int, bytes]:
+            # TODO: implement this
+            raise NotImplementedError('SDES: not implemented: encode()')
+
+        @classmethod
+        def parse(cls, sc: int, buf: memoryview) -> 'RTCP.SDES':
+            # TODO: implement this
+            raise NotImplementedError('SDES: not implemented: parse()', sc, buf)
+
+    class BYE(Packet):
+        src    : list[int]
+        reason : str
+
+        def __init__(self, src: list[int], reason: str):
+            self.src    = src
+            self.reason = reason
+
+        def __repr__(self) -> str:
+            return '\n'.join([
+                'RTCP.BYE {',
+                '    src    = %08x' % self.src,
+                '    reason = %s' % (self.reason or '(unknown)'),
+                '}',
+            ])
+
+        def encode(self) -> tuple['RTCP.Type', int, bytes]:
+            slen = len(self.src)
+            reason = self.reason.encode('utf-8')
+
+            # reason is optional
+            if not reason:
+                return RTCP.Type.BYE, slen, struct.pack('>%dI' % slen, *self.src)
+
+            # pad the reason bytes to a multiple of 4
+            rbuf = reason.ljust((((len(reason) - 1) >> 2) + 1) << 2, b'\x00')
+            return RTCP.Type.BYE, slen, struct.pack('>%dII' % slen, *self.src, len(reason)) + rbuf
+
+        @classmethod
+        def parse(cls, sc: int, buf: memoryview) -> 'RTCP.BYE':
+            rem = buf[sc * 4:]
+            src = struct.unpack('>%dI' % sc, buf[:sc * 4])
+
+            # no reason section
+            if not rem:
+                return cls(list(src), '')
+
+            # parse the reason
+            nb, = struct.pack('>I', rem[:4])
+            rlen = (((nb - 1) >> 2) + 1) << 2
+
+            # check for packet length
+            if len(rem) > rlen + 4:
+                Logger.for_name('rtcp.bye').warning('Garbage after BYE packet.')
+
+            # extract the reason
+            reason = rem[4:nb + 4]
+            return cls(list(src), bytes(reason).decode('utf-8'))
+
+    class APP(Packet):
+        src  : int
+        kind : int
+        name : str
+        data : bytes
+
+        def __init__(self,
+            src  : int,
+            kind : int,
+            name : str,
+            data : bytes,
+        ):
+            self.src  = src
+            self.kind = kind
+            self.name = name
+            self.data = data
+
+        def __repr__(self) -> str:
+            return '\n'.join([
+                'RTCP.APP {',
+                '    src  = %08x' % self.src,
+                '    kind = %d' % self.kind,
+                '    name = %s' % self.name,
+                '    data = %s' % (
+                    ('\n' + ' ' * 11).join(hexdump.dumpgen(self.data))
+                    if self.data
+                    else '(empty)'
+                ),
+                '}',
+            ])
+
+        def encode(self) -> tuple['RTCP.Type', int, bytes]:
+            if len(self.data) & 3:
+                raise ValueError('application data length must be multiples of 4')
+            else:
+                return RTCP.Type.APP, self.kind, struct.pack('4s', self.name.encode('ascii')) + self.data
+
+        @classmethod
+        def parse(cls, ty: int, buf: memoryview) -> 'RTCP.APP':
+            src, name = struct.unpack('>I4s', buf[:8])
+            return cls(src, ty, name.decode('ascii'), bytes(buf[8:]))
+
+    @classmethod
+    def parse(cls, data: bytes) -> Packet:
+        data = memoryview(data)
+        flags, pt, size = struct.unpack('>BBH', data[:4])
+
+        # check for data length
+        if len(data) < (size + 1) * 4:
+            raise ValueError('incomplete packet')
+
+        # trim the packet by length
+        if len(data) > (size + 1) * 4:
+            data = data[:(size + 1) * 4]
+            Logger.for_name('rtcp').warning('Garbage after data, discarded.')
+
+        # check version
+        if flags >> 6 != 2:
+            raise ValueError('invalid protocol version')
+
+        # remove padding bytes if any
+        if flags & 0x20:
+            if not data:
+                raise ValueError('missing padding bytes')
+            else:
+                data = data[:-data[-1]]
+
+        # parse the individual packet
+        match cls.Type(pt):
+            case cls.Type.SR   : return cls.SR.parse(flags & 0x1f, data[4:])
+            case cls.Type.RR   : return cls.RR.parse(flags & 0x1f, data[4:])
+            case cls.Type.BYE  : return cls.BYE.parse(flags & 0x1f, data[4:])
+            case cls.Type.APP  : return cls.APP.parse(flags & 0x1f, data[4:])
+            case cls.Type.SDES : return cls.SDES.parse(flags & 0x1f, data[4:])
+            case _             : raise SystemError('unreachable')
+
+    @classmethod
+    def encode(cls, data: Packet) -> bytes:
+        ty, rc, body = data.encode()
+        wlen, flags = len(body), 0x80 | (rc & 0x1f)
+
+        # body length must be multiples of 4
+        if wlen & 3:
+            raise ValueError('invalid encoded packet body')
+
+        # pad to multiples of 16 bytes
+        if wlen & 15:
+            num = 16 - (wlen & 15)
+            body += bytes([num]) * num
+            flags |= 0x20
+
+        # construct the packet
+        wlen >>= 2
+        return struct.pack('>BBH', flags, ty, wlen) + body
 
 class RTSP:
     class Error(Response, Exception):
@@ -1160,7 +1504,23 @@ class StreamingServer(SupportsAuthenticationContext):
 
     async def _handle_rtcp(self, rtcp: UdpSocket):
         while True:
-            print('RTCP', await rtcp.recvfrom())
+            buf, addr = await rtcp.recvfrom()
+            sink = self.link.get(addr)
+
+            # check for sink
+            if sink is None:
+                self.log.warning('Unexpected packet from %s:%d, discarded.', *addr)
+                continue
+
+            # parse the request
+            try:
+                req = RTCP.parse(buf)
+            except ValueError:
+                self.log.warning('Cannot parse packet from %s:%d, discarded.', *addr)
+                continue
+
+            # TODO: handle RTCP request
+            print(req)
 
     async def run(self):
         rtp  = await UdpSocket.new(local_addr = (self.host, self.port))
